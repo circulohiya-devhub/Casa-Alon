@@ -15,11 +15,12 @@ _pms.py) are all pure efficiency optimizations. Losing them on a cold start
 just means one extra re-fetch or re-login, never a wrong answer or a bad
 booking, so they're left as simple in-process caches.
 
-If UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN aren't set, every
-function here degrades to "no memory": conversation history won't persist
-between messages and reservations can still be prepared and confirmed within
-a single exchange, but not across a long gap. That's enough to run and test
-the bot; set the Redis env vars for real guest traffic.
+If no Redis credentials are found (see _redis() below for the two naming
+conventions checked), every function here degrades to "no memory":
+conversation history won't persist between messages and reservations can
+still be prepared and confirmed within a single exchange, but not across a
+long gap. That's enough to run and test the bot; set the Redis env vars for
+real guest traffic.
 """
 import json
 import logging
@@ -38,15 +39,30 @@ _client_checked = False
 
 
 def _redis():
+    """
+    Checks two naming conventions, in order:
+      1. UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN — the canonical
+         Upstash names, set if you created the database directly at
+         console.upstash.com.
+      2. KV_REST_API_URL / KV_REST_API_TOKEN — Vercel's own legacy "KV"
+         naming, which is what the Vercel Storage tab / Marketplace
+         integration actually injects when you connect an Upstash database
+         that way, even though the database itself is plain Upstash Redis.
+    """
     global _client, _client_checked
     if _client_checked:
         return _client
     _client_checked = True
-    if not (os.getenv("UPSTASH_REDIS_REST_URL") and os.getenv("UPSTASH_REDIS_REST_TOKEN")):
-        log.warning("UPSTASH_REDIS_REST_URL/TOKEN not set — chat memory will not persist between messages")
+    url = os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN")
+    if not (url and token):
+        log.warning(
+            "No Redis credentials found (checked UPSTASH_REDIS_REST_URL/TOKEN and "
+            "KV_REST_API_URL/TOKEN) — chat memory will not persist between messages"
+        )
         return None
     from upstash_redis import Redis
-    _client = Redis.from_env()
+    _client = Redis(url=url, token=token)
     return _client
 
 
