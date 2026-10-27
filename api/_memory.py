@@ -61,8 +61,12 @@ def _redis():
             "KV_REST_API_URL/TOKEN) — chat memory will not persist between messages"
         )
         return None
-    from upstash_redis import Redis
-    _client = Redis(url=url, token=token)
+    try:
+        from upstash_redis import Redis
+        _client = Redis(url=url, token=token)
+    except Exception:
+        log.exception("Failed to construct the Redis client — chat memory will not persist between messages")
+        _client = None
     return _client
 
 

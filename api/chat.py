@@ -142,9 +142,16 @@ def chat(req: ChatRequest, request: Request, background: BackgroundTasks):
     text = req.message.strip()
     try:
         result = rag.answer(text, thread_id=f"web:{req.session_id}")
-    except Exception:
+    except Exception as e:
         log.exception("Failed to answer web:%s", req.session_id)
-        raise HTTPException(status_code=503, detail="The assistant is temporarily unavailable")
+        detail = "The assistant is temporarily unavailable"
+        # TEMPORARY troubleshooting aid: with CHAT_DEBUG=true, the real error
+        # is included in the response so it's visible in the browser's
+        # Network tab. Turn it off once fixed — it exposes internal error
+        # text to anyone using the chat.
+        if os.getenv("CHAT_DEBUG", "false").lower() == "true":
+            detail = f"{type(e).__name__}: {e}"[:800]
+        raise HTTPException(status_code=503, detail=detail)
 
     if result.get("reservation"):
         background.add_task(notify_staff, "web", req.session_id, text, result["answer"],
