@@ -1,0 +1,7 @@
+fastapi
+requests
+langchain
+langchain-google-genai
+langchain-text-splitters
+langgraph
+upstash-redis

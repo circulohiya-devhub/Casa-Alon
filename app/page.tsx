@@ -8,7 +8,6 @@ import Location from "@/components/Location";
 import Testimonials from "@/components/Testimonials";
 import CTA from "@/components/CTA";
 import Footer from "@/components/Footer";
-import ChatWidget from "@/components/ChatWidget";
 
 export default function Home() {
   return (
@@ -27,7 +26,6 @@ export default function Home() {
       <WaveDivider from="#1F3A3D" to="#EFE6D8" flip />
       <CTA />
       <Footer />
-      <ChatWidget />
     </main>
   );
 }
