@@ -19,6 +19,14 @@ import json
 import logging
 import os
 import re
+import sys
+from pathlib import Path
+
+# Vercel's Python runtime loads this file directly by path (not as a normal
+# package import), so this directory isn't automatically searched for the
+# sibling modules below (_rag, _pms, _kb, _memory). Add it to sys.path
+# explicitly, before importing any of them.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
