@@ -13,12 +13,46 @@ const GREETING: Message = {
     "Hi, I'm Ask Alon. I can tell you about rooms, rates, amenities, or how to get here — what do you want to know?",
 };
 
+const SESSION_STORAGE_KEY = "casa-alon-session-id";
+
+function getSessionId(): string {
+  if (typeof window === "undefined") return "";
+  let id = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    window.localStorage.setItem(SESSION_STORAGE_KEY, id);
+  }
+  return id;
+}
+
 export default function ChatWidget() {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([GREETING]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [sessionId, setSessionId] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // On mount: grab (or create) this visitor's session ID, then try to
+  // restore their previous conversation from Redis. If Redis isn't
+  // configured, or there's nothing stored yet, this just no-ops and the
+  // greeting stays as-is.
+  useEffect(() => {
+    const id = getSessionId();
+    setSessionId(id);
+    if (!id) return;
+
+    fetch(`/api/chat?sessionId=${encodeURIComponent(id)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { history?: Message[] } | null) => {
+        if (data?.history && data.history.length > 0) {
+          setMessages([GREETING, ...data.history]);
+        }
+      })
+      .catch(() => {
+        // No stored history available — fine, keep the greeting.
+      });
+  }, []);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -40,6 +74,9 @@ export default function ChatWidget() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
+          sessionId,
+          // Sent as a fallback only — if Redis has stored history for
+          // this session, the server prefers that over this.
           history: nextMessages.slice(0, -1),
         }),
       });

@@ -22,11 +22,11 @@ scaffold to replace with your real property details before launch.
 
 ```bash
 npm install
-cp .env.example .env.local   # then add your Google API key
+cp .env.example .env.local   # then fill in the values described below
 npm run dev
 ```
 
-Get a `GOOGLE_API_KEY` from [Google AI Studio](https://aistudio.google.com/app/apikey) — it's used for both the Gemini chat model and the embeddings model in the chatbot.
+Only `GOOGLE_API_KEY` is required — get one from [Google AI Studio](https://aistudio.google.com/app/apikey). The LangSmith and Upstash Redis variables in `.env.example` are both optional; see below.
 
 ## How the chatbot works
 
@@ -38,12 +38,35 @@ backend). On each message it:
    vector store (`lib/rag.ts`), built at cold start from the documents in
    `lib/knowledge.ts`.
 2. Sends the retrieved chunks plus the recent conversation to
-   `gemini-1.5-flash` with a system prompt that tells it to only answer
+   `gemini-3.8-flash` with a system prompt that tells it to only answer
    from that context, and to point guests to `stay@casaalon.com` for
    anything it doesn't know (bookings included — it's not wired to
    actually create a reservation).
 3. Returns the reply to `components/ChatWidget.tsx`, the floating bubble
    in the bottom-right corner.
+
+### LangSmith tracing (optional)
+
+Set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, and `LANGCHAIN_PROJECT`
+(from [smith.langchain.com](https://smith.langchain.com)) and every chat
+turn shows up as a run in your LangSmith dashboard — retrieved context,
+prompt, and model response included. The route handler wraps its logic in
+`traceable()` from the `langsmith` package for this. Leave these unset and
+tracing is just skipped, nothing else changes.
+
+### Persistent chat memory via Upstash Redis (optional)
+
+Set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` (from an
+[Upstash](https://upstash.com) Redis database — the REST API credentials,
+not the Redis connection string) and each visitor's conversation is saved
+server-side, keyed by a session ID the browser generates and stores in
+`localStorage`. Reopening the site restores their previous conversation
+instead of starting over. History is capped at the last 20 turns and
+expires after 7 days (`lib/redis.ts`).
+
+Leave these unset and the chatbot still works — it just falls back to the
+original behavior: history lives only in the browser tab's memory and
+resets on reload.
 
 ### Growing past the placeholder knowledge base
 
@@ -68,10 +91,8 @@ started, but worth outgrowing deliberately:
   whichever backend you choose, add a tool/function call so the model
   can check real availability rather than quoting the static rates in
   `lib/knowledge.ts`.
-- **Conversation memory across requests**: this version is stateless
-  between page loads (history only lives in the browser tab). If you
-  want persisted conversations, Upstash Redis via Vercel Storage — the
-  same service used on the portfolio site — is a natural fit.
+- **Conversation memory across requests**: already wired in — see
+  "Persistent chat memory via Upstash Redis" above.
 
 ## Deploying
 
