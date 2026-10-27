@@ -26,7 +26,7 @@ let vectorStorePromise: Promise<MemoryVectorStore> | null = null;
 function getEmbeddings() {
   return new GoogleGenerativeAIEmbeddings({
     apiKey: process.env.GOOGLE_API_KEY,
-    model: "text-embedding-004",
+    model: "gemini-embedding-001",
   });
 }
 
