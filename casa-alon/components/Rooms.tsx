@@ -1,0 +1,84 @@
+type Room = {
+  name: string;
+  size: string;
+  sleeps: string;
+  rate: string;
+  description: string;
+  swatch: string;
+};
+
+const ROOMS: Room[] = [
+  {
+    name: "Tide Room",
+    size: "22 sqm",
+    sleeps: "2 guests",
+    rate: "from ₱4,800/night",
+    description:
+      "A garden-facing studio with a queen bed, a reading corner, and shutters that stay open most of the day. The quietest rooms in the house.",
+    swatch: "linear-gradient(135deg, #7FA996 0%, #1F3A3D 100%)",
+  },
+  {
+    name: "Horizon Room",
+    size: "30 sqm",
+    sleeps: "2–3 guests",
+    rate: "from ₱6,900/night",
+    description:
+      "Second floor, sea-facing, with a private balcony and a daybed for the afternoon nap you didn't plan on taking. Best light in the house.",
+    swatch: "linear-gradient(135deg, #C9962C 0%, #1F3A3D 100%)",
+  },
+  {
+    name: "Driftwood Loft",
+    size: "45 sqm",
+    sleeps: "4 guests",
+    rate: "from ₱9,500/night",
+    description:
+      "A two-level suite with a private terrace and a soaking tub built into reclaimed wood. For the trip you're not telling anyone the real price of.",
+    swatch: "linear-gradient(135deg, #1F3A3D 0%, #122321 100%)",
+  },
+];
+
+export default function Rooms() {
+  return (
+    <section id="stay" className="bg-foam px-6 py-24 md:px-10">
+      <div className="mx-auto max-w-6xl">
+        <h2 className="max-w-measure font-display text-4xl text-ink md:text-5xl">
+          Nine rooms, three moods
+        </h2>
+        <p className="mt-4 max-w-measure text-ink/70">
+          Every room looks out on something — a garden, the water, or both.
+          Rates are per night, run high in dry season, and always include
+          breakfast.
+        </p>
+
+        <div className="mt-16 space-y-16">
+          {ROOMS.map((room, i) => (
+            <div
+              key={room.name}
+              className={`grid items-center gap-8 md:grid-cols-2 md:gap-16 ${
+                i % 2 === 1 ? "md:[&>*:first-child]:order-2" : ""
+              }`}
+            >
+              <div
+                className="aspect-[4/3] w-full rounded-sm"
+                style={{ background: room.swatch }}
+                aria-hidden="true"
+              />
+              <div>
+                <h3 className="font-display text-2xl text-tide md:text-3xl">
+                  {room.name}
+                </h3>
+                <p className="mt-2 text-sm text-ink/60">
+                  {room.size}, {room.sleeps}
+                  <span className="block">{room.rate}</span>
+                </p>
+                <p className="mt-4 max-w-measure text-ink/80">
+                  {room.description}
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
