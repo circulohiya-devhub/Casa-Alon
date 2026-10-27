@@ -250,6 +250,10 @@ class HotelogixClient(PMSClient):
                 self.source_by_channel[k.strip().lower()] = v.strip()
         self.guest_country_code = os.getenv("HOTELOGIX_GUEST_COUNTRY_CODE", "PH")
         self.guest_country = os.getenv("HOTELOGIX_GUEST_COUNTRY", "Philippines")
+        # This property's Hotelogix setup rejects savebooking when the guest's
+        # address1 is empty. The bot doesn't collect street addresses, so a
+        # placeholder is sent; staff can fill in the real one when confirming.
+        self.guest_address = os.getenv("HOTELOGIX_GUEST_ADDRESS", "Not provided (booked via chat)")
         self._booking_lock = threading.Lock()  # one booking at a time: the cart belongs to the access key
         self._access_key: str | None = None
         self._access_secret: str | None = None
@@ -296,6 +300,14 @@ class HotelogixClient(PMSClient):
         # confirmbooking 1602, ...), and all of them say "SUCCESS".
         if code != "0" and message.strip().upper() != "SUCCESS":
             raise PMSError(f"Hotelogix {method} error {code}: {message}")
+        # Some failures come back with no "status" block at all, just a bare
+        # {"code": ..., "message": ...} — e.g. savebooking's
+        # {"code": 23000, "message": "SQLSTATE[23000]: Integrity constraint violation ..."}.
+        # Without this check those were treated as success.
+        if not status and response.get("code") is not None:
+            bare_message = str(response.get("message", ""))
+            if bare_message.strip().upper() != "SUCCESS":
+                raise PMSError(f"Hotelogix {method} error {response.get('code')}: {bare_message[:500]}")
         return response
 
     def _authenticate(self) -> None:
@@ -410,6 +422,7 @@ class HotelogixClient(PMSClient):
             "email": {"value": guest.email},
             "mobile": {"value": guest.mobile},
             "phone": {"value": guest.mobile},
+            "address1": {"value": self.guest_address},
             "country": {"code": self.guest_country_code, "value": self.guest_country},
         }
 
@@ -463,8 +476,11 @@ class HotelogixClient(PMSClient):
             }, retry=False)
             order_id, codes = _find_order(saved)
             if not order_id and not codes:
-                log.warning("savebooking succeeded but no order id was found: %s",
-                            json.dumps(saved, default=str)[:1500])
+                # No order id means nothing was saved in Hotelogix. Never report
+                # this as ON_HOLD: the guest would be told a room is held when it isn't.
+                log.error("savebooking returned no order id, treating as failed: %s",
+                          json.dumps(saved, default=str)[:1500])
+                raise PMSError("Hotelogix savebooking returned no order id")
 
             status = "ON_HOLD"
             if CONFIRM_BOOKINGS and order_id:
