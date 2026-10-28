@@ -37,6 +37,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
+import _booking as booking
 import _memory as memory
 import _pms as pms
 from _kb import kb
@@ -55,7 +56,6 @@ MAX_NIGHTS = int(os.getenv("MAX_NIGHTS", "30"))
 
 BOOKINGS_ENABLED = os.getenv("BOOKINGS_ENABLED", "false").lower() == "true"
 MAX_BOOKINGS_PER_GUEST_PER_DAY = int(os.getenv("MAX_BOOKINGS_PER_GUEST_PER_DAY", "2"))
-PENDING_MINUTES = 15
 
 HANDOFF_TAG = "[[HANDOFF]]"
 ERROR_REPLY = (
@@ -66,12 +66,11 @@ ERROR_REPLY = (
 if BOOKINGS_ENABLED:
     BOOKING_RULES = """
 MAKING A RESERVATION
-- You can place one room per reservation ON HOLD in the hotel system. No payment is collected in this chat. Our team reviews every held reservation and contacts the guest to confirm it.
+- You can request a hold on ONE room per reservation. No payment is collected in this chat. The guest confirms by email: nothing is held until they click Confirm in the email we send them.
 - Before reserving you need, from this conversation: the room type and a live rate check for the guest's dates and number of guests, plus the guest's first name, last name, email address, and mobile number. Ask for anything missing. Never make up or assume guest details.
-- Then call prepare_reservation and show the guest the summary it returns, including the "Held until" date. Ask them to reply YES to confirm.
+- Then call prepare_reservation. If it returns CONFIRMATION EMAIL SENT, share the summary and tell the guest to check their email (including spam) and click Confirm within the time given. Never say the room is held, reserved, or booked at this point.
 - If prepare_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
-- Call confirm_reservation only after the guest has replied YES to that summary. Never call it in the same reply as prepare_reservation.
-- After confirm_reservation, use its exact result: RESERVATION ON HOLD means the room is held and our team will contact the guest to confirm it. Tell the guest the "Held until" date and that the room is released if the down payment isn't made by then. Never say a held reservation is confirmed. Give the reservation number when there is one.
+- If the guest says they didn't get the email, ask them to check the address and spam folder. Call prepare_reservation again only if they give a corrected address.
 - You cannot change or cancel reservations. Hand those requests to staff.
 """
     BOOKING_HANDOFF = "- The guest wants to change or cancel a reservation, or a reservation could not be completed"
@@ -81,7 +80,7 @@ else:
     BOOKING_HANDOFF = ("- The guest clearly says they want to book (for example \"I'll take the Deluxe\"), or wants to "
                        "change or cancel a booking. Only sharing rates is not a reason to hand off.")
 
-BOOKING_TOOLS = ("- prepare_reservation and confirm_reservation: reserving a room (see MAKING A RESERVATION).\n"
+BOOKING_TOOLS = ("- prepare_reservation: emailing the guest a reservation to confirm (see MAKING A RESERVATION).\n"
                  if BOOKINGS_ENABLED else "")
 
 SYSTEM_PROMPT = f"""You are the front-desk assistant for {HOTEL_NAME}, replying to guests on chat apps.
@@ -214,16 +213,12 @@ def get_current_promos() -> str:
 
 
 # ------------------------------------------------------------------
-# Reservations: the AI collects details, the code decides when to book
+# Reservations: the AI collects details; the guest confirms by email
 # ------------------------------------------------------------------
+# The chat never places a hold itself. prepare_reservation emails the guest a
+# summary with a Confirm button; the hold is placed only when they confirm on
+# the page that button opens (api/confirm.py -> _booking.place_hold).
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-YES_RE = re.compile(r"\b(yes|yep|yeah|yup|confirm|confirmed|go ahead|proceed|book it|oo|opo|sige|tuloy)\b", re.I)
-NO_RE = re.compile(r"\b(no|not|don't|dont|wait|hindi|huwag|cancel|change)\b", re.I)
-
-# Set by confirm_reservation, read by answer() immediately after the same
-# agent.invoke() call returns — this never needs to survive a request
-# boundary, so (unlike the state above) plain in-process storage is fine.
-_new_reservation: dict[str, dict] = {}
 
 
 def _thread(config: RunnableConfig) -> str:
@@ -231,21 +226,6 @@ def _thread(config: RunnableConfig) -> str:
     file about why this is a separate config key from LangGraph's own
     'thread_id'."""
     return (config or {}).get("configurable", {}).get("guest_thread_id", "")
-
-
-def hold_deadline(check_in: date, today: date) -> date | None:
-    """When an on-hold reservation expires, based on days until arrival.
-    None means book & buy: too close to arrival for a hold."""
-    lead = (check_in - today).days
-    if lead >= 30:
-        return today + timedelta(days=10)
-    if lead >= 14:
-        return today + timedelta(days=5)
-    if lead >= 7:
-        return today + timedelta(days=3)
-    if lead >= 3:
-        return today + timedelta(days=1)
-    return None
 
 
 def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
@@ -268,9 +248,9 @@ def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
 def prepare_reservation(check_in: str, check_out: str, adults: int, children: int, room_type: str,
                         first_name: str, last_name: str, email: str, mobile: str,
                         config: RunnableConfig) -> str:
-    """Prepare a reservation for ONE room and get the summary to show the guest. This does not book yet.
-    Use only when the guest has chosen a room and given their dates, number of adults and children,
-    first name, last name, email, and mobile number. Dates must be YYYY-MM-DD."""
+    """Email the guest a reservation summary with a Confirm button, for ONE room. Nothing is held until
+    the guest confirms from that email. Use only when the guest has chosen a room and given their dates,
+    number of adults and children, first name, last name, email, and mobile number. Dates must be YYYY-MM-DD."""
     thread = _thread(config)
     ci, co, error = _validate_stay(check_in, check_out, adults, children)
     if error:
@@ -283,7 +263,7 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
     if not 7 <= len(re.sub(r"\D", "", mobile)) <= 15:
         return "ERROR: that mobile number doesn't look right. Ask the guest to check it."
 
-    hold_till = hold_deadline(ci, _today())
+    hold_till = booking.hold_deadline(ci, _today())
     if hold_till is None:
         return ("ERROR: BOOK_AND_BUY. Arrival is within 2 days, so this booking can't be placed on hold: "
                 "it needs full payment at booking, which can't be done in this chat. "
@@ -302,81 +282,29 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
         available = ", ".join(sorted({o.room_type for o in offers})) or "none"
         return f"ERROR: {room_type} is not available for those dates. Available room types: {available}."
 
-    memory.set_pending(thread, {
+    request = {
         "check_in": ci.isoformat(), "check_out": co.isoformat(), "adults": adults, "children": children,
         "room_type": offer.room_type, "rate_plan": offer.rate_plan,
         "total": offer.total_price, "currency": offer.currency,
+        "cancellation": offer.cancellation or "",
         "guest": asdict(pms.Guest(first_name, last_name, email, mobile)),
-        "hold_till": hold_till.isoformat(),
-        "turn": memory.get_turn(thread), "created": time.time(),
-    })
+        "hold_till": hold_till.isoformat(), "thread": thread, "created": time.time(),
+    }
+    status = booking.start_email_confirmation(request)
+    if status != "OK":
+        return status
+
     nights = (co - ci).days
     return (
-        "RESERVATION SUMMARY (not booked yet). Show this to the guest and ask them to reply YES to confirm:\n"
+        f"CONFIRMATION EMAIL SENT to {email}. NOTHING IS HELD YET. Tell the guest to open that email "
+        f"(check spam too) and click Confirm within {booking.CONFIRM_LINK_HOURS} hours to place the hold. "
+        "Do not say the room is held or reserved. Summary to share:\n"
         f"Room: {offer.room_type} ({offer.rate_plan})\n"
         f"Dates: {ci:%B %d, %Y} to {co:%B %d, %Y} ({nights} night{'s' if nights != 1 else ''})\n"
-        f"Guests: {adults} adult{'s' if adults != 1 else ''}" + (f", {children} child{'ren' if children != 1 else ''}" if children else "") + "\n"
-        f"Total: {offer.currency} {offer.total_price:,.2f} (no payment is collected in this chat)\n"
-        f"Held until: {hold_till:%B %d, %Y} (the down payment must be made by then, or the room is released)\n"
-        f"Name: {first_name} {last_name}\nEmail: {email}\nMobile: {mobile}"
-        + (f"\nCancellation: {offer.cancellation}" if offer.cancellation else "")
+        f"Total: {offer.currency} {offer.total_price:,.2f} (no payment is collected online)\n"
+        f"If confirmed today, held until: {hold_till:%B %d, %Y} (the down payment must be made by then, "
+        "or the room is released)"
     )
-
-
-@tool
-def confirm_reservation(config: RunnableConfig) -> str:
-    """Create the reservation prepared with prepare_reservation.
-    Call ONLY after the guest has replied YES to the reservation summary."""
-    thread = _thread(config)
-    pending = memory.get_pending(thread)
-    last_message = memory.get_last_message(thread)
-    turn = memory.get_turn(thread)
-
-    if not pending or time.time() - pending["created"] > PENDING_MINUTES * 60:
-        return "ERROR: there is no reservation waiting for confirmation. Prepare it again with prepare_reservation."
-    if pending["turn"] >= turn:
-        return "ERROR: show the summary to the guest first and wait for their reply."
-    if not YES_RE.search(last_message) or NO_RE.search(last_message):
-        return "ERROR: the guest has not clearly confirmed. Ask them to reply YES to confirm, or tell you what to change."
-
-    guest = pms.Guest(**pending["guest"])
-    ci, co = date.fromisoformat(pending["check_in"]), date.fromisoformat(pending["check_out"])
-    try:
-        result = pms.get_client().create_reservation(
-            ci, co, pending["adults"], pending["children"],
-            pending["room_type"], pending["total"], guest,
-            channel=thread.split(":", 1)[0] if ":" in thread else "",
-            hold_till=date.fromisoformat(pending["hold_till"]) if pending.get("hold_till") else None,
-        )
-    except pms.PriceChangedError as e:
-        memory.clear_pending(thread)
-        return (f"ERROR: the price changed to {e.currency} {e.new_total:,.2f}. Nothing was booked. "
-                "Tell the guest the new total and ask if they still want it.")
-    except pms.NotAvailableError:
-        memory.clear_pending(thread)
-        return "ERROR: that room just became unavailable. Nothing was booked. Offer to check other rooms."
-    except Exception:
-        log.exception("Reservation failed for %s", thread)
-        return ("ERROR: the reservation could not be completed. Do not tell the guest it is booked. "
-                f"Give the front desk contact {FRONT_DESK} and hand off.")
-
-    memory.clear_pending(thread)
-    memory.record_booking(thread)
-    _new_reservation[thread] = asdict(result)
-    number = ", ".join(result.reservation_codes) or result.order_id
-    if result.status == "ON_HOLD":
-        ref = f" Reference number: {number}." if number else ""
-        held = (f" Held until {date.fromisoformat(result.hold_till):%B %d, %Y}: the room is released if the "
-                "down payment isn't made by then." if result.hold_till else "")
-        return (f"RESERVATION ON HOLD.{ref} {result.room_type}, total {result.currency} {result.total_price:,.2f}.{held} "
-                "Tell the guest their room is on hold, no payment was collected in this chat, and our team "
-                "will contact them by email or mobile to confirm the reservation. Do not say it is confirmed.")
-    if result.status == "CONFIRMED":
-        return (f"RESERVATION CONFIRMED. Reservation number: {number} (order {result.order_id}). "
-                f"{result.room_type}, total {result.currency} {result.total_price:,.2f}. "
-                "Give the guest the reservation number and tell them no payment was collected in this chat.")
-    return ("RESERVATION STATUS UNKNOWN. Do not tell the guest it is booked. "
-            f"Give the front desk contact {FRONT_DESK} and hand off.")
 
 
 model = init_chat_model(f"google_genai:{CHAT_MODEL}")
@@ -384,7 +312,7 @@ model = init_chat_model(f"google_genai:{CHAT_MODEL}")
 agent = create_agent(
     model,
     [retrieve_context, check_rates_and_availability, get_current_promos]
-    + ([prepare_reservation, confirm_reservation] if BOOKINGS_ENABLED else []),
+    + ([prepare_reservation] if BOOKINGS_ENABLED else []),
     system_prompt=SYSTEM_PROMPT,
     checkpointer=InMemorySaver(),
 )
@@ -428,5 +356,6 @@ def answer(question: str, thread_id: str) -> dict:
     history.append({"role": "assistant", "content": text})
     memory.save_history(thread_id, history)
 
-    reservation = _new_reservation.pop(thread_id, None)
-    return {"answer": text, "handoff": handoff, "reservation": reservation}
+    # Holds are placed from the email confirm page (api/confirm.py), which
+    # alerts staff itself, so the chat never returns a new reservation.
+    return {"answer": text, "handoff": handoff, "reservation": None}

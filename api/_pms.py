@@ -31,6 +31,8 @@ CACHE_SECONDS = int(os.getenv("PMS_CACHE_SECONDS", "300"))  # reuse identical se
 CONFIRM_BOOKINGS = os.getenv("HOTELOGIX_CONFIRM_BOOKINGS", "false").lower() == "true"
 # Format of the holdTill value sent with savebooking (Python strftime codes).
 HOLD_TILL_FORMAT = os.getenv("HOTELOGIX_HOLD_TILL_FORMAT", "%Y-%m-%d %H:%M:%S")
+# false (default): Hotelogix doesn't email the guest; the bot sends its own emails.
+SEND_HOTELOGIX_EMAIL = os.getenv("HOTELOGIX_SEND_EMAIL", "false").lower() == "true"
 
 
 class PMSError(Exception):
@@ -479,6 +481,9 @@ class HotelogixClient(PMSClient):
                 "guest": guest_payload,
                 "hotels": [hotel_payload],
             }
+            if not SEND_HOTELOGIX_EMAIL:
+                # The guest gets our own emails (see _booking.py) instead of Hotelogix's.
+                booking_request["doNotSendEmail"] = {"value": 1}
             if hold_till:
                 # The schema lists holdTill but not its format; HOTELOGIX_HOLD_TILL_FORMAT
                 # can change it. Default: the end of the deadline day, hotel local time.
