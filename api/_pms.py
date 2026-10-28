@@ -29,6 +29,8 @@ CACHE_SECONDS = int(os.getenv("PMS_CACHE_SECONDS", "300"))  # reuse identical se
 # false (default): the bot only saves reservations ON HOLD, and staff confirm them in the PMS.
 # true: the bot also confirms them (payment type "Other", no payment).
 CONFIRM_BOOKINGS = os.getenv("HOTELOGIX_CONFIRM_BOOKINGS", "false").lower() == "true"
+# Format of the holdTill value sent with savebooking (Python strftime codes).
+HOLD_TILL_FORMAT = os.getenv("HOTELOGIX_HOLD_TILL_FORMAT", "%Y-%m-%d %H:%M:%S")
 
 
 class PMSError(Exception):
@@ -87,6 +89,7 @@ class ReservationResult:
     rate_plan: str
     total_price: float
     currency: str
+    hold_till: str = ""         # hold expiry date (YYYY-MM-DD) sent to the PMS, if any
 
 
 class PMSClient(ABC):
@@ -100,7 +103,7 @@ class PMSClient(ABC):
 
     def create_reservation(self, check_in: date, check_out: date, adults: int, children: int,
                            room_type: str, expected_total: float, guest: Guest,
-                           channel: str = "") -> ReservationResult:
+                           channel: str = "", hold_till: date | None = None) -> ReservationResult:
         """Reserve one room. Re-checks price and availability first."""
         raise PMSError("Reservations are not supported by this PMS provider")
 
@@ -182,7 +185,7 @@ class MockPMS(PMSClient):
         return [o for o in offers if o.rooms_left]
 
     def create_reservation(self, check_in, check_out, adults, children, room_type, expected_total, guest,
-                           channel=""):
+                           channel="", hold_till=None):
         offer = _pick_offer(self.search(check_in, check_out, adults, children), room_type)
         if not offer:
             raise NotAvailableError(room_type)
@@ -191,7 +194,8 @@ class MockPMS(PMSClient):
         status = "CONFIRMED" if CONFIRM_BOOKINGS else "ON_HOLD"
         log.info("MOCK reservation %s (%s) for %s %s", code, status, guest.first_name, guest.last_name)
         return ReservationResult(status, code, [code], offer.room_type, offer.rate_plan,
-                                 offer.total_price, offer.currency)
+                                 offer.total_price, offer.currency,
+                                 hold_till.isoformat() if hold_till else "")
 
     def promos(self):
         return [
@@ -422,12 +426,13 @@ class HotelogixClient(PMSClient):
             "email": {"value": guest.email},
             "mobile": {"value": guest.mobile},
             "phone": {"value": guest.mobile},
+            "address": {"value": self.guest_address},
             "address1": {"value": self.guest_address},
             "country": {"code": self.guest_country_code, "value": self.guest_country},
         }
 
     def create_reservation(self, check_in, check_out, adults, children, room_type, expected_total, guest,
-                           channel=""):
+                           channel="", hold_till=None):
         """search -> addtocart -> savebooking (ON HOLD), then confirmbooking only if
         HOTELOGIX_CONFIRM_BOOKINGS=true (payment type OTH, no payment)."""
         with self._booking_lock:
@@ -468,19 +473,26 @@ class HotelogixClient(PMSClient):
                 if value:
                     hotel_payload[field] = {"value": value}
 
-            saved = self._call("savebooking", {
+            booking_request = {
                 "isTemp": {"value": False},
                 "isGroupBooking": {"value": False},
                 "guest": guest_payload,
                 "hotels": [hotel_payload],
-            }, retry=False)
+            }
+            if hold_till:
+                # The schema lists holdTill but not its format; HOTELOGIX_HOLD_TILL_FORMAT
+                # can change it. Default: the end of the deadline day, hotel local time.
+                booking_request["holdTill"] = {"value": datetime(
+                    hold_till.year, hold_till.month, hold_till.day, 23, 59, 59
+                ).strftime(HOLD_TILL_FORMAT)}
+            saved = self._call("savebooking", booking_request, retry=False)
             order_id, codes = _find_order(saved)
             if not order_id and not codes:
-                # No order id means nothing was saved in Hotelogix. Never report
-                # this as ON_HOLD: the guest would be told a room is held when it isn't.
-                log.error("savebooking returned no order id, treating as failed: %s",
-                          json.dumps(saved, default=str)[:1500])
-                raise PMSError("Hotelogix savebooking returned no order id")
+                # Normal for an on-hold save: the response schema makes the order block
+                # optional, and savebooking_test.txt shows a real hold with no order id.
+                # Failures are raised in _post instead. Logged so staff can match it up.
+                log.info("savebooking saved on hold with no order id in the response: %s",
+                         json.dumps(saved, default=str)[:1500])
 
             status = "ON_HOLD"
             if CONFIRM_BOOKINGS and order_id:
@@ -498,7 +510,8 @@ class HotelogixClient(PMSClient):
 
             log.info("Hotelogix reservation %s: order %s, codes %s", status, order_id, codes)
             return ReservationResult(status, order_id or "", codes, offer.room_type, offer.rate_plan,
-                                     offer.total_price, offer.currency)
+                                     offer.total_price, offer.currency,
+                                     hold_till.isoformat() if hold_till else "")
 
     def promos(self):
         # The Web API has no separate promo call. Promos and packages come back as

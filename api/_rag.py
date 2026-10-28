@@ -27,7 +27,7 @@ import os
 import re
 import time
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from langchain.agents import create_agent
@@ -68,9 +68,10 @@ if BOOKINGS_ENABLED:
 MAKING A RESERVATION
 - You can place one room per reservation ON HOLD in the hotel system. No payment is collected in this chat. Our team reviews every held reservation and contacts the guest to confirm it.
 - Before reserving you need, from this conversation: the room type and a live rate check for the guest's dates and number of guests, plus the guest's first name, last name, email address, and mobile number. Ask for anything missing. Never make up or assume guest details.
-- Then call prepare_reservation and show the guest the summary it returns. Ask them to reply YES to confirm.
+- Then call prepare_reservation and show the guest the summary it returns, including the "Held until" date. Ask them to reply YES to confirm.
+- If prepare_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
 - Call confirm_reservation only after the guest has replied YES to that summary. Never call it in the same reply as prepare_reservation.
-- After confirm_reservation, use its exact result: RESERVATION ON HOLD means the room is held and our team will contact the guest to confirm it. Never say a held reservation is confirmed. Give the reservation number when there is one.
+- After confirm_reservation, use its exact result: RESERVATION ON HOLD means the room is held and our team will contact the guest to confirm it. Tell the guest the "Held until" date and that the room is released if the down payment isn't made by then. Never say a held reservation is confirmed. Give the reservation number when there is one.
 - You cannot change or cancel reservations. Hand those requests to staff.
 """
     BOOKING_HANDOFF = "- The guest wants to change or cancel a reservation, or a reservation could not be completed"
@@ -232,6 +233,21 @@ def _thread(config: RunnableConfig) -> str:
     return (config or {}).get("configurable", {}).get("guest_thread_id", "")
 
 
+def hold_deadline(check_in: date, today: date) -> date | None:
+    """When an on-hold reservation expires, based on days until arrival.
+    None means book & buy: too close to arrival for a hold."""
+    lead = (check_in - today).days
+    if lead >= 30:
+        return today + timedelta(days=10)
+    if lead >= 14:
+        return today + timedelta(days=5)
+    if lead >= 7:
+        return today + timedelta(days=3)
+    if lead >= 3:
+        return today + timedelta(days=1)
+    return None
+
+
 def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
     try:
         ci, co = date.fromisoformat(check_in), date.fromisoformat(check_out)
@@ -267,6 +283,12 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
     if not 7 <= len(re.sub(r"\D", "", mobile)) <= 15:
         return "ERROR: that mobile number doesn't look right. Ask the guest to check it."
 
+    hold_till = hold_deadline(ci, _today())
+    if hold_till is None:
+        return ("ERROR: BOOK_AND_BUY. Arrival is within 2 days, so this booking can't be placed on hold: "
+                "it needs full payment at booking, which can't be done in this chat. "
+                f"Tell the guest and hand off to the front desk ({FRONT_DESK}).")
+
     if memory.recent_booking_count(thread) >= MAX_BOOKINGS_PER_GUEST_PER_DAY:
         return "ERROR: this guest has reached the daily limit for chat reservations. Hand off to staff."
 
@@ -285,6 +307,7 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
         "room_type": offer.room_type, "rate_plan": offer.rate_plan,
         "total": offer.total_price, "currency": offer.currency,
         "guest": asdict(pms.Guest(first_name, last_name, email, mobile)),
+        "hold_till": hold_till.isoformat(),
         "turn": memory.get_turn(thread), "created": time.time(),
     })
     nights = (co - ci).days
@@ -294,6 +317,7 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
         f"Dates: {ci:%B %d, %Y} to {co:%B %d, %Y} ({nights} night{'s' if nights != 1 else ''})\n"
         f"Guests: {adults} adult{'s' if adults != 1 else ''}" + (f", {children} child{'ren' if children != 1 else ''}" if children else "") + "\n"
         f"Total: {offer.currency} {offer.total_price:,.2f} (no payment is collected in this chat)\n"
+        f"Held until: {hold_till:%B %d, %Y} (the down payment must be made by then, or the room is released)\n"
         f"Name: {first_name} {last_name}\nEmail: {email}\nMobile: {mobile}"
         + (f"\nCancellation: {offer.cancellation}" if offer.cancellation else "")
     )
@@ -322,6 +346,7 @@ def confirm_reservation(config: RunnableConfig) -> str:
             ci, co, pending["adults"], pending["children"],
             pending["room_type"], pending["total"], guest,
             channel=thread.split(":", 1)[0] if ":" in thread else "",
+            hold_till=date.fromisoformat(pending["hold_till"]) if pending.get("hold_till") else None,
         )
     except pms.PriceChangedError as e:
         memory.clear_pending(thread)
@@ -341,7 +366,9 @@ def confirm_reservation(config: RunnableConfig) -> str:
     number = ", ".join(result.reservation_codes) or result.order_id
     if result.status == "ON_HOLD":
         ref = f" Reference number: {number}." if number else ""
-        return (f"RESERVATION ON HOLD.{ref} {result.room_type}, total {result.currency} {result.total_price:,.2f}. "
+        held = (f" Held until {date.fromisoformat(result.hold_till):%B %d, %Y}: the room is released if the "
+                "down payment isn't made by then." if result.hold_till else "")
+        return (f"RESERVATION ON HOLD.{ref} {result.room_type}, total {result.currency} {result.total_price:,.2f}.{held} "
                 "Tell the guest their room is on hold, no payment was collected in this chat, and our team "
                 "will contact them by email or mobile to confirm the reservation. Do not say it is confirmed.")
     if result.status == "CONFIRMED":
