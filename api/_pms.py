@@ -260,6 +260,12 @@ class HotelogixClient(PMSClient):
         # address1 is empty. The bot doesn't collect street addresses, so a
         # placeholder is sent; staff can fill in the real one when confirming.
         self.guest_address = os.getenv("HOTELOGIX_GUEST_ADDRESS", "Not provided (booked via chat)")
+        # Also required by savebooking (the request schema lists them as mandatory guest
+        # fields; an empty city fails with "Column 'city' cannot be null"). The bot
+        # doesn't collect them, so placeholders are sent; staff update them if needed.
+        self.guest_city = os.getenv("HOTELOGIX_GUEST_CITY", "Not provided")
+        self.guest_state = os.getenv("HOTELOGIX_GUEST_STATE", "Not provided")
+        self.guest_zip = os.getenv("HOTELOGIX_GUEST_ZIP", "0000")
         self._booking_lock = threading.Lock()  # one booking at a time: the cart belongs to the access key
         self._access_key: str | None = None
         self._access_secret: str | None = None
@@ -430,6 +436,9 @@ class HotelogixClient(PMSClient):
             "phone": {"value": guest.mobile},
             "address": {"value": self.guest_address},
             "address1": {"value": self.guest_address},
+            "city": {"value": self.guest_city},
+            "state": {"value": self.guest_state},
+            "zip": {"value": self.guest_zip},
             "country": {"code": self.guest_country_code, "value": self.guest_country},
         }
 

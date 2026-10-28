@@ -188,7 +188,7 @@ def check_rates_and_availability(check_in: str, check_out: str, adults: int, chi
             parts.append("Limited availability")
         lines.append(". ".join(parts) + ".")
     if not any(o.cancellation for o in offers):
-        lines.append("For cancellation terms, use the cancellation policy in the hotel information.")
+        lines.append("Cancellation terms were not included for these rates; say the front desk can confirm them.")
     return "\n".join(lines)
 
 
@@ -201,8 +201,10 @@ def get_current_promos() -> str:
         log.exception("PMS promo lookup failed")
         promos = None
     if not promos:
-        return ("No promos returned by the reservation system. Use retrieve_context to check "
-                "promos in the hotel information instead.")
+        return ("Promos and packages are offered as special rates for specific dates. Ask the guest for "
+                "their dates and number of guests, then use check_rates_and_availability: any deals "
+                "available for those dates appear as rate plans in its results. Never describe a promo "
+                "that did not come from a tool result.")
     lines = ["Current promos (live from the reservation system):"]
     for p in promos:
         dates = ""
