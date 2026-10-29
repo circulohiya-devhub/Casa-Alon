@@ -1,4 +1,6 @@
+import Image from "next/image";
 import Nav from "./Nav";
+import { PHOTOS } from "./photos";
 
 export default function Hero() {
   return (
@@ -6,14 +8,25 @@ export default function Hero() {
       id="top"
       className="relative flex min-h-[92vh] flex-col justify-end overflow-hidden bg-ink"
     >
-      {/* Tide gradient backdrop — stands in for photography until real
-          property shots are dropped in. Swap this block for an <img> or
-          next/image once you have them. */}
+      {/* Header banner photo. Swap it in components/photos.ts. */}
+      <Image
+        src={PHOTOS.hero.src}
+        alt={PHOTOS.hero.alt}
+        fill
+        priority
+        sizes="100vw"
+        className="object-cover"
+      />
+      {/* Darkens the bottom-left, where the headline sits, and the top edge
+          behind the navigation, so text stays readable over any photo. */}
       <div
         className="absolute inset-0"
+        aria-hidden="true"
         style={{
           background:
-            "radial-gradient(ellipse at 20% 20%, #1F3A3D 0%, #122321 55%, #0B1716 100%)",
+            "linear-gradient(to top, rgba(18,35,33,.92) 0%, rgba(18,35,33,.55) 38%, rgba(18,35,33,.10) 70%), " +
+            "linear-gradient(to bottom, rgba(18,35,33,.55) 0%, rgba(18,35,33,0) 22%), " +
+            "linear-gradient(to right, rgba(18,35,33,.45) 0%, rgba(18,35,33,0) 60%)",
         }}
       />
 

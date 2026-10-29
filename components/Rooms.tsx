@@ -1,10 +1,13 @@
+import Image from "next/image";
+import { PHOTOS, type Photo } from "./photos";
+
 type Room = {
   name: string;
   size: string;
   sleeps: string;
   rate: string;
   description: string;
-  swatch: string;
+  photo: Photo;
 };
 
 const ROOMS: Room[] = [
@@ -15,7 +18,7 @@ const ROOMS: Room[] = [
     rate: "from ₱4,800/night",
     description:
       "A garden-facing studio with a queen bed, a reading corner, and shutters that stay open most of the day. The quietest rooms in the house.",
-    swatch: "linear-gradient(135deg, #7FA996 0%, #1F3A3D 100%)",
+    photo: PHOTOS.tideRoom,
   },
   {
     name: "Horizon Room",
@@ -24,7 +27,7 @@ const ROOMS: Room[] = [
     rate: "from ₱6,900/night",
     description:
       "Second floor, sea-facing, with a private balcony and a daybed for the afternoon nap you didn't plan on taking. Best light in the house.",
-    swatch: "linear-gradient(135deg, #C9962C 0%, #1F3A3D 100%)",
+    photo: PHOTOS.horizonRoom,
   },
   {
     name: "Driftwood Loft",
@@ -33,7 +36,7 @@ const ROOMS: Room[] = [
     rate: "from ₱9,500/night",
     description:
       "A two-level suite with a private terrace and a soaking tub built into reclaimed wood. For the trip you're not telling anyone the real price of.",
-    swatch: "linear-gradient(135deg, #1F3A3D 0%, #122321 100%)",
+    photo: PHOTOS.driftwoodLoft,
   },
 ];
 
@@ -58,11 +61,15 @@ export default function Rooms() {
                 i % 2 === 1 ? "md:[&>*:first-child]:order-2" : ""
               }`}
             >
-              <div
-                className="aspect-[4/3] w-full rounded-sm"
-                style={{ background: room.swatch }}
-                aria-hidden="true"
-              />
+              <div className="relative aspect-[4/3] w-full overflow-hidden rounded-sm bg-sand">
+                <Image
+                  src={room.photo.src}
+                  alt={room.photo.alt}
+                  fill
+                  sizes="(min-width: 768px) 50vw, 100vw"
+                  className="object-cover"
+                />
+              </div>
               <div>
                 <h3 className="font-display text-2xl text-tide md:text-3xl">
                   {room.name}

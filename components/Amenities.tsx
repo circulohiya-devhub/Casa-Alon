@@ -1,8 +1,14 @@
-const AMENITIES = [
+import Image from "next/image";
+import { PHOTOS, type Photo } from "./photos";
+
+type Amenity = { name: string; note: string; span: string; photo?: Photo };
+
+const AMENITIES: Amenity[] = [
   {
     name: "Saltwater pool",
     note: "Unheated, unchlorinated, open from sunrise.",
     span: "md:col-span-2 md:row-span-2",
+    photo: PHOTOS.pool,
   },
   {
     name: "Beach access & kayaks",
@@ -43,10 +49,27 @@ export default function Amenities() {
           {AMENITIES.map((item) => (
             <div
               key={item.name}
-              className={`flex flex-col justify-end border border-foam/15 p-6 ${item.span}`}
+              className={`relative flex flex-col justify-end overflow-hidden border border-foam/15 p-6 ${
+                item.photo ? "min-h-[320px]" : ""
+              } ${item.span}`}
             >
-              <p className="font-display text-xl text-foam">{item.name}</p>
-              <p className="mt-2 text-sm text-foam/60">{item.note}</p>
+              {item.photo && (
+                <>
+                  <Image
+                    src={item.photo.src}
+                    alt={item.photo.alt}
+                    fill
+                    sizes="(min-width: 768px) 50vw, 100vw"
+                    className="object-cover"
+                  />
+                  <div
+                    className="absolute inset-0 bg-gradient-to-t from-tide via-tide/40 to-transparent"
+                    aria-hidden="true"
+                  />
+                </>
+              )}
+              <p className="relative font-display text-xl text-foam">{item.name}</p>
+              <p className="relative mt-2 text-sm text-foam/75">{item.note}</p>
             </div>
           ))}
         </div>

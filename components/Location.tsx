@@ -1,3 +1,5 @@
+const MAP_QUERY = "Barangay San Pedro, Puerto Princesa, Palawan";
+
 export default function Location() {
   return (
     <section id="location" className="bg-foam px-6 py-24 md:px-10">
@@ -32,13 +34,13 @@ export default function Location() {
             </div>
           </dl>
         </div>
-        <div
-          className="min-h-[320px] rounded-sm"
-          style={{
-            background:
-              "radial-gradient(circle at 70% 30%, #7FA996 0%, #1F3A3D 60%, #122321 100%)",
-          }}
-          aria-hidden="true"
+        {/* Google Maps embed: needs no API key. Change MAP_QUERY to move the pin. */}
+        <iframe
+          title="Map of Casa Alon's area in Puerto Princesa"
+          src={`https://maps.google.com/maps?q=${encodeURIComponent(MAP_QUERY)}&z=14&output=embed`}
+          className="min-h-[320px] w-full rounded-sm border-0 bg-sand"
+          loading="lazy"
+          referrerPolicy="no-referrer-when-downgrade"
         />
       </div>
     </section>
