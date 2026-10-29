@@ -111,7 +111,7 @@ WHEN TO HAND OFF TO STAFF
 End your reply with the exact tag {HANDOFF_TAG} when any of these apply:
 - You could not answer the question from the tool results
 {BOOKING_HANDOFF}
-- The stay is longer than {MAX_NIGHTS} nights, or the guest needs more than one room, or has special requests such as events or group stays
+- A tool says the stay is longer than the hotel accepts online, or the guest needs more than one room, or has special requests such as events or group stays
 - The guest has a complaint, a refund request, or asks to talk to a person
 In those cases, give the front desk contact {FRONT_DESK}. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
 
@@ -134,6 +134,24 @@ def retrieve_context(query: str):
     return serialized, docs
 
 
+def _night_limit_error(nights: int) -> str | None:
+    """The hotel's own online stay limits (from its PMS settings), capped by MAX_NIGHTS."""
+    try:
+        min_nights, max_nights = pms.get_client().stay_limits()
+    except Exception:
+        log.exception("Could not read stay limits")
+        min_nights, max_nights = 1, 0
+    limit = min(MAX_NIGHTS, max_nights) if max_nights else MAX_NIGHTS
+    if nights > limit:
+        return (f"ERROR: stays longer than {limit} nights can't be booked online. Tell the guest our team "
+                "will arrange it, ask for their name and a mobile number or email if you don't have them, "
+                "and hand off to staff.")
+    if min_nights > 1 and nights < min_nights:
+        return (f"ERROR: the minimum stay for online bookings is {min_nights} nights. Tell the guest, "
+                "and offer to check a longer stay or hand off to staff.")
+    return None
+
+
 def _today() -> date:
     return datetime.now(HOTEL_TIMEZONE).date()
 
@@ -154,8 +172,9 @@ def check_rates_and_availability(check_in: str, check_out: str, adults: int, chi
     if co <= ci:
         return "ERROR: check-out must be after check-in. Ask the guest to confirm their dates."
     nights = (co - ci).days
-    if nights > MAX_NIGHTS:
-        return f"ERROR: stays over {MAX_NIGHTS} nights need a custom quote. Hand off to staff."
+    limit_error = _night_limit_error(nights)
+    if limit_error:
+        return limit_error
     if not (1 <= adults <= 10 and 0 <= children <= 10):
         return "ERROR: the number of guests looks wrong. Ask the guest to confirm."
 
@@ -244,8 +263,9 @@ def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
         return None, None, "ERROR: check-in is in the past. Ask the guest to confirm their dates."
     if co <= ci:
         return None, None, "ERROR: check-out must be after check-in."
-    if (co - ci).days > MAX_NIGHTS:
-        return None, None, f"ERROR: stays over {MAX_NIGHTS} nights need a custom quote. Hand off to staff."
+    limit_error = _night_limit_error((co - ci).days)
+    if limit_error:
+        return None, None, limit_error
     if not (1 <= adults <= 10 and 0 <= children <= 10):
         return None, None, "ERROR: the number of guests looks wrong. Ask the guest to confirm."
     return ci, co, None

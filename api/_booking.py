@@ -268,6 +268,7 @@ ALERT_SUBJECTS = {
     "reservation": "On-hold reservation placed",
     "booking_failed": "ACTION NEEDED: a chat reservation failed",
     "booking_uncertain": "ACTION NEEDED: check StayGrid for a chat reservation",
+    "hold_not_applied": "URGENT: block a chat reservation before it expires",
     "book_and_buy": "ACTION NEEDED: guest needs a book & buy reservation",
     "booking_limit": "ACTION NEEDED: guest hit the chat booking limit",
 }
@@ -312,7 +313,13 @@ def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None =
     lines += [f"{k}: {v}" for k, v in rows]
     if note:
         lines += ["", f"Details: {note}"]
-    if event == "booking_uncertain":
+    if event == "hold_not_applied":
+        hold = p.get("hold_till")
+        lines += ["", "This reservation was saved in StayGrid as Temp Reserved, but couldn't be blocked "
+                      "automatically, so it will expire on StayGrid's short default hold (about an hour)."
+                      + (f" Block it until {date.fromisoformat(hold):%B %d, %Y} now," if hold else " Block it now,")
+                      + " then contact the guest with the down payment details."]
+    elif event == "booking_uncertain":
         hold = (reservation or {}).get("hold_till") or p.get("hold_till")
         lines += ["", "The reservation system timed out while saving this hold, so it may have been created. "
                       "Check StayGrid for a reservation under this guest's name."
@@ -443,7 +450,13 @@ def place_hold(token: str) -> tuple[bool, str, str]:
         # failed (they'd book again) or that it's held (it may not be). Staff check.
         log.warning("Hold outcome unknown for %s: %s", thread, e)
         memory.record_booking(thread)
-        notify_staff("booking_uncertain", p, f"{type(e).__name__}: {e}"[:500])
+        if isinstance(e, pms.HoldNotAppliedError):
+            # Saved as Temp Reserved, which expires on Hotelogix's short default.
+            notify_staff("hold_not_applied", p, f"{e}"[:500],
+                         reservation={"order_id": e.order_id, "reservation_codes": e.codes,
+                                      "hold_till": p.get("hold_till")})
+        else:
+            notify_staff("booking_uncertain", p, f"{type(e).__name__}: {e}"[:500])
         return False, "We're finishing your hold", (
             "Your request reached our reservation system, but it was slow to confirm. "
             "Our team will check your hold and contact you by email or mobile. "

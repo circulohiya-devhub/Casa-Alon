@@ -34,6 +34,12 @@ HOLD_TILL_FORMAT = os.getenv("HOTELOGIX_HOLD_TILL_FORMAT", "%Y-%m-%d %H:%M:%S")
 # Seconds to wait for Hotelogix. Saving a booking can be much slower than a lookup.
 TIMEOUT_SECONDS = int(os.getenv("HOTELOGIX_TIMEOUT", "20"))
 SAVE_TIMEOUT_SECONDS = int(os.getenv("HOTELOGIX_SAVE_TIMEOUT", "40"))
+# Placing the hold: savebooking creates a short-lived "Temp Reserved" booking, then
+# confirmbooking with a pay-later payment type (bank transfer is BLOCKED in this
+# property's web settings) blocks it until the holdTill date. Staff mark it Reserved
+# once the down payment arrives.
+HOLD_VIA_CONFIRM = os.getenv("HOTELOGIX_HOLD_VIA_CONFIRM", "true").lower() == "true"
+HOLD_PAYMENT_TYPE = os.getenv("HOTELOGIX_HOLD_PAYMENT_TYPE", "bank")
 # Calls that create or change a booking: a timeout there doesn't mean nothing happened.
 WRITE_METHODS = {"savebooking", "confirmbooking"}
 # false (default): Hotelogix doesn't email the guest; the bot sends its own emails.
@@ -69,6 +75,15 @@ class Promo:
 
 class PMSUncertainError(PMSError):
     """A booking request timed out, so it may or may not have been saved."""
+
+
+class HoldNotAppliedError(PMSUncertainError):
+    """The booking was saved (Temp Reserved) but couldn't be moved to Blocked until
+    the hold date, so it will expire on Hotelogix's short default unless staff act."""
+
+    def __init__(self, order_id: str, codes: list, reason: str):
+        super().__init__(f"Saved as order {order_id or '(unknown)'} but not blocked: {reason}")
+        self.order_id, self.codes = order_id, codes
 
 
 class PriceChangedError(PMSError):
@@ -117,6 +132,11 @@ class PMSClient(ABC):
                            channel: str = "", hold_till: date | None = None) -> ReservationResult:
         """Reserve one room. Re-checks price and availability first."""
         raise PMSError("Reservations are not supported by this PMS provider")
+
+    def stay_limits(self) -> tuple[int, int]:
+        """(minimum nights, maximum nights) the hotel accepts for online bookings.
+        0 means no limit."""
+        return 1, 0
 
 
 def _pick_offer(offers: list[RoomOffer], room_type: str) -> RoomOffer | None:
@@ -442,6 +462,23 @@ class HotelogixClient(PMSClient):
         skip = {"logo", "description", "seasons", "roomtypes"}  # large and not needed here
         return {k: v for k, v in hotel.items() if k not in skip}
 
+    def stay_limits(self) -> tuple[int, int]:
+        """minNoNight / maxNoNight from this hotel's Hotelogix web settings, so each
+        hotel's own limits apply. Cached; if the settings can't be read, no limit is
+        applied here (the booking step would still reject a stay Hotelogix refuses)."""
+        cached = getattr(self, "_stay_limits", None)
+        if cached and time.time() - cached[0] < 6 * 3600:
+            return cached[1]
+        try:
+            options = self.get_hotel_options()
+            web = options.get("websettings") or options.get("webSettings") or {}
+            limits = (int(web.get("minNoNight") or 1), int(web.get("maxNoNight") or 0))
+        except Exception:
+            log.exception("Could not read the hotel's night limits")
+            return 1, 0
+        self._stay_limits = (time.time(), limits)
+        return limits
+
     def _guest_payload(self, guest: Guest) -> dict:
         return {
             "fname": {"value": guest.first_name},
@@ -459,8 +496,9 @@ class HotelogixClient(PMSClient):
 
     def create_reservation(self, check_in, check_out, adults, children, room_type, expected_total, guest,
                            channel="", hold_till=None):
-        """search -> addtocart -> savebooking (ON HOLD), then confirmbooking only if
-        HOTELOGIX_CONFIRM_BOOKINGS=true (payment type OTH, no payment)."""
+        """search -> addtocart -> savebooking (Temp Reserved), then confirmbooking:
+        with HOTELOGIX_CONFIRM_BOOKINGS=true it confirms (payment type OTH, no payment);
+        otherwise it blocks the booking until hold_till with a pay-later payment type."""
         with self._booking_lock:
             # Fresh login and fresh search, so the rate id and price are current.
             with self._auth_lock:
@@ -508,12 +546,6 @@ class HotelogixClient(PMSClient):
             if not SEND_HOTELOGIX_EMAIL:
                 # The guest gets our own emails (see _booking.py) instead of Hotelogix's.
                 booking_request["doNotSendEmail"] = {"value": 1}
-            if hold_till:
-                # The schema lists holdTill but not its format; HOTELOGIX_HOLD_TILL_FORMAT
-                # can change it. Default: the end of the deadline day, hotel local time.
-                booking_request["holdTill"] = {"value": datetime(
-                    hold_till.year, hold_till.month, hold_till.day, 23, 59, 59
-                ).strftime(HOLD_TILL_FORMAT)}
             saved = self._call("savebooking", booking_request, retry=False)
             order_id, codes = _find_order(saved)
             if not order_id and not codes:
@@ -536,6 +568,24 @@ class HotelogixClient(PMSClient):
                     codes = _find_order(confirmed)[1] or codes
                 except PMSError:
                     log.exception("Hotelogix confirmbooking failed for order %s (left on hold)", order_id)
+            elif HOLD_VIA_CONFIRM and hold_till:
+                if not order_id:
+                    raise HoldNotAppliedError("", codes, "savebooking returned no order id to block")
+                # The schema lists holdTill but not its format; HOTELOGIX_HOLD_TILL_FORMAT can
+                # change it. Default: the end of the deadline day, hotel local time.
+                hold_value = datetime(hold_till.year, hold_till.month, hold_till.day,
+                                      23, 59, 59).strftime(HOLD_TILL_FORMAT)
+                try:
+                    blocked = self._call("confirmbooking", {
+                        "orderId": {"value": order_id},
+                        "payment": {"type": HOLD_PAYMENT_TYPE, "amount": "0",
+                                    "description": "Held via chatbot - awaiting down payment"},
+                        "holdTill": {"value": hold_value},
+                    }, retry=False)
+                    codes = _find_order(blocked)[1] or codes
+                except PMSError as e:
+                    log.exception("Hotelogix could not block order %s until %s", order_id, hold_value)
+                    raise HoldNotAppliedError(order_id, codes, str(e)) from e
 
             log.info("Hotelogix reservation %s: order %s, codes %s", status, order_id, codes)
             return ReservationResult(status, order_id or "", codes, offer.room_type, offer.rate_plan,
@@ -577,6 +627,9 @@ class CachedPMS(PMSClient):
 
     def promos(self):
         return self._get(("promos",), self.inner.promos)
+
+    def stay_limits(self):
+        return self.inner.stay_limits()
 
     def create_reservation(self, *args, **kwargs):
         try:
