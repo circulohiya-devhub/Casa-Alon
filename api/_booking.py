@@ -267,6 +267,7 @@ def _on_hold_email(p: dict, result: pms.ReservationResult) -> tuple[str, str, st
 ALERT_SUBJECTS = {
     "reservation": "On-hold reservation placed",
     "booking_failed": "ACTION NEEDED: a chat reservation failed",
+    "booking_uncertain": "ACTION NEEDED: check StayGrid for a chat reservation",
     "book_and_buy": "ACTION NEEDED: guest needs a book & buy reservation",
     "booking_limit": "ACTION NEEDED: guest hit the chat booking limit",
 }
@@ -311,7 +312,14 @@ def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None =
     lines += [f"{k}: {v}" for k, v in rows]
     if note:
         lines += ["", f"Details: {note}"]
-    if event == "booking_failed":
+    if event == "booking_uncertain":
+        hold = (reservation or {}).get("hold_till") or p.get("hold_till")
+        lines += ["", "The reservation system timed out while saving this hold, so it may have been created. "
+                      "Check StayGrid for a reservation under this guest's name."
+                      + (f" If it's there, make sure it's held until {date.fromisoformat(hold):%B %d, %Y}"
+                         " and contact the guest with the down payment details." if hold else "")
+                      + " If it isn't, contact the guest to book."]
+    elif event == "booking_failed":
         lines += ["", "Check StayGrid: a temporary reservation may have been created under this guest's name. "
                       "Contact the guest to complete or cancel it."]
     elif event == "reservation":
@@ -430,6 +438,16 @@ def place_hold(token: str) -> tuple[bool, str, str]:
         return False, "The price has changed", (
             f"The total is now {e.currency} {e.new_total:,.2f}, so nothing was held. "
             f"Please start again in our chat, or contact our front desk at {FRONT_DESK}.")
+    except pms.PMSUncertainError as e:
+        # The request may have created the reservation, so never tell the guest it
+        # failed (they'd book again) or that it's held (it may not be). Staff check.
+        log.warning("Hold outcome unknown for %s: %s", thread, e)
+        memory.record_booking(thread)
+        notify_staff("booking_uncertain", p, f"{type(e).__name__}: {e}"[:500])
+        return False, "We're finishing your hold", (
+            "Your request reached our reservation system, but it was slow to confirm. "
+            "Our team will check your hold and contact you by email or mobile. "
+            "Please don't send the request again.")
     except pms.NotAvailableError:
         return False, "The room is no longer available", (
             "That room was just booked by someone else, so nothing was held. "

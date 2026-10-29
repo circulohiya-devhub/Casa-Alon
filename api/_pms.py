@@ -31,6 +31,11 @@ CACHE_SECONDS = int(os.getenv("PMS_CACHE_SECONDS", "300"))  # reuse identical se
 CONFIRM_BOOKINGS = os.getenv("HOTELOGIX_CONFIRM_BOOKINGS", "false").lower() == "true"
 # Format of the holdTill value sent with savebooking (Python strftime codes).
 HOLD_TILL_FORMAT = os.getenv("HOTELOGIX_HOLD_TILL_FORMAT", "%Y-%m-%d %H:%M:%S")
+# Seconds to wait for Hotelogix. Saving a booking can be much slower than a lookup.
+TIMEOUT_SECONDS = int(os.getenv("HOTELOGIX_TIMEOUT", "20"))
+SAVE_TIMEOUT_SECONDS = int(os.getenv("HOTELOGIX_SAVE_TIMEOUT", "40"))
+# Calls that create or change a booking: a timeout there doesn't mean nothing happened.
+WRITE_METHODS = {"savebooking", "confirmbooking"}
 # false (default): Hotelogix doesn't email the guest; the bot sends its own emails.
 SEND_HOTELOGIX_EMAIL = os.getenv("HOTELOGIX_SEND_EMAIL", "false").lower() == "true"
 
@@ -60,6 +65,10 @@ class Promo:
     valid_from: str | None = None   # stay dates, YYYY-MM-DD
     valid_to: str | None = None
     conditions: str = ""
+
+
+class PMSUncertainError(PMSError):
+    """A booking request timed out, so it may or may not have been saved."""
 
 
 class PriceChangedError(PMSError):
@@ -290,8 +299,14 @@ class HotelogixClient(PMSClient):
                 f"{self.base_url}/{method}",
                 data=body.encode(),
                 headers={"Content-Type": "application/json", "X-HAPI-Signature": signature},
-                timeout=20,
+                timeout=SAVE_TIMEOUT_SECONDS if method in WRITE_METHODS else TIMEOUT_SECONDS,
             )
+        except requests.Timeout as e:
+            if method in WRITE_METHODS:
+                # Hotelogix may still have saved it (a timed-out savebooking has been seen
+                # to create the reservation anyway), so this is unknown, not failed.
+                raise PMSUncertainError(f"Hotelogix {method} timed out; it may have been saved: {e}") from e
+            raise PMSError(f"Hotelogix {method} request failed: {e}") from e
         except requests.RequestException as e:
             raise PMSError(f"Hotelogix {method} request failed: {e}") from e
         if r.status_code >= 400:
