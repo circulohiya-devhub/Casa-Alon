@@ -66,13 +66,13 @@ ERROR_REPLY = (
 if BOOKINGS_ENABLED:
     BOOKING_RULES = """
 MAKING A RESERVATION
-- You can request a hold on ONE room per reservation. No payment is collected in this chat. The guest confirms by email: nothing is held until they click Confirm in the email we send them.
+- You can place ONE room per reservation ON HOLD in the hotel system. No payment is collected in this chat: after the hold is placed, the guest is emailed the payment details, and our team confirms the reservation once the down payment is received.
 - Before reserving you need, from this conversation: the room type and a live rate check for the guest's dates and number of guests, plus the guest's first name, last name, email address, and mobile number. Ask for anything missing. Never make up or assume guest details.
-- Then call review_reservation and show the guest the summary it returns, asking them to reply YES so you can send the confirmation email. Nothing is sent yet at this point.
-- Call send_confirmation_email only after the guest replies YES to that summary. Never call it in the same reply as review_reservation.
+- Then call review_reservation and show the guest the summary it returns, asking them to reply YES. Nothing is held yet at this point.
+- Call place_reservation only after the guest replies YES to that summary. Never call it in the same reply as review_reservation.
 - If the guest corrects anything (for example their email address), call review_reservation again with the corrected details and show the new summary.
-- If send_confirmation_email returns CONFIRMATION EMAIL SENT, tell the guest to check their email (including spam) and click Confirm within the time given. Never say the room is held, reserved, or booked at this point.
-- If review_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
+- After place_reservation, use its exact result. RESERVATION ON HOLD: give the reference number, the "held until" date, and the down payment (the minimum and the full amount), and say the payment details were emailed. Say the room is on hold, never that it is confirmed. HOLD BEING FINALIZED: say our team is finishing the hold and will contact them; never say it is held, and never ask them to try again.
+- If review_reservation or place_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
 - You cannot change or cancel reservations. Hand those requests to staff.
 """
     BOOKING_HANDOFF = "- The guest wants to change or cancel a reservation, or a reservation could not be completed"
@@ -82,7 +82,7 @@ else:
     BOOKING_HANDOFF = ("- The guest clearly says they want to book (for example \"I'll take the Deluxe\"), or wants to "
                        "change or cancel a booking. Only sharing rates is not a reason to hand off.")
 
-BOOKING_TOOLS = ("- review_reservation and send_confirmation_email: reserving a room (see MAKING A RESERVATION).\n"
+BOOKING_TOOLS = ("- review_reservation and place_reservation: reserving a room (see MAKING A RESERVATION).\n"
                  if BOOKINGS_ENABLED else "")
 
 SYSTEM_PROMPT = f"""You are the front-desk assistant for {HOTEL_NAME}, replying to guests on chat apps.
@@ -236,14 +236,13 @@ def get_current_promos() -> str:
 
 
 # ------------------------------------------------------------------
-# Reservations: the AI collects details; the guest confirms by email
+# Reservations: the AI collects details; a YES in chat places the hold
 # ------------------------------------------------------------------
-# The chat never places a hold itself:
+# How a reservation is placed:
 #   1. review_reservation checks the live price and shows the guest a summary.
 #   2. After the guest replies YES (checked in code, on a later message),
-#      send_confirmation_email emails them a summary with a Confirm button.
-#   3. The hold is placed only when they confirm on the page that button opens
-#      (api/confirm.py -> _booking.place_hold).
+#      place_reservation places the hold (_booking.place_hold_now), which
+#      also emails the guest the payment details.
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -331,8 +330,9 @@ def review_reservation(check_in: str, check_out: str, adults: int, children: int
     guests = f"{adults} adult{'s' if adults != 1 else ''}" + (
         f", {children} child{'ren' if children != 1 else ''}" if children else "")
     return (
-        "SUMMARY (nothing sent or held yet). Show it to the guest exactly, then ask: "
-        f"\"Is everything correct? Reply YES and I'll send the confirmation email to {email}.\"\n"
+        "SUMMARY (nothing held yet). Show it to the guest exactly, then ask: "
+        "\"Is everything correct? Reply YES and I'll place your room on hold and email you the payment "
+        f"details at {email}.\"\n"
         f"Room: {offer.room_type} ({offer.rate_plan})\n"
         f"Dates: {ci:%B %d, %Y} to {co:%B %d, %Y} ({nights} night{'s' if nights != 1 else ''})\n"
         f"Guests: {guests}\n"
@@ -344,9 +344,10 @@ def review_reservation(check_in: str, check_out: str, adults: int, children: int
 
 
 @tool
-def send_confirmation_email(config: RunnableConfig) -> str:
-    """Email the guest the reservation reviewed with review_reservation, with a Confirm button.
-    Call ONLY after the guest has replied YES to that summary, never in the same reply as review_reservation."""
+def place_reservation(config: RunnableConfig) -> str:
+    """Place the reservation reviewed with review_reservation ON HOLD in the hotel system, and email the
+    guest the payment details. Call ONLY after the guest has replied YES to that summary, never in the
+    same reply as review_reservation."""
     thread = _thread(config)
     pending = memory.get_pending(thread)
     if not pending or time.time() - pending["created"] > REVIEW_MINUTES * 60:
@@ -355,19 +356,11 @@ def send_confirmation_email(config: RunnableConfig) -> str:
         return "ERROR: show the summary to the guest first and wait for their reply."
     last_message = memory.get_last_message(thread)
     if not YES_RE.search(last_message) or NO_RE.search(last_message):
-        return ("ERROR: the guest has not clearly approved the summary. Ask them to reply YES to send the "
-                "email, or tell you what to change.")
-
+        return ("ERROR: the guest has not clearly approved the summary. Ask them to reply YES to place the "
+                "hold, or tell you what to change.")
+    memory.clear_pending(thread)  # cleared first, so a repeated YES can't book twice
     request = {k: v for k, v in pending.items() if k != "turn"}
-    status = booking.start_email_confirmation(request)
-    if status != "OK":
-        return status
-    memory.clear_pending(thread)
-    return (
-        f"CONFIRMATION EMAIL SENT to {pending['guest']['email']}. NOTHING IS HELD YET. Tell the guest to open "
-        f"that email (check spam too) and click Confirm within {booking.CONFIRM_LINK_HOURS} hours to place the "
-        "hold. Do not say the room is held, reserved, or booked."
-    )
+    return booking.place_hold_now(request)
 
 
 model = init_chat_model(f"google_genai:{CHAT_MODEL}")
@@ -375,7 +368,7 @@ model = init_chat_model(f"google_genai:{CHAT_MODEL}")
 agent = create_agent(
     model,
     [retrieve_context, check_rates_and_availability, get_current_promos]
-    + ([review_reservation, send_confirmation_email] if BOOKINGS_ENABLED else []),
+    + ([review_reservation, place_reservation] if BOOKINGS_ENABLED else []),
     system_prompt=SYSTEM_PROMPT,
     checkpointer=InMemorySaver(),
 )
@@ -419,6 +412,6 @@ def answer(question: str, thread_id: str) -> dict:
     history.append({"role": "assistant", "content": text})
     memory.save_history(thread_id, history)
 
-    # Holds are placed from the email confirm page (api/confirm.py), which
-    # alerts staff itself, so the chat never returns a new reservation.
+    # Holds are placed by place_reservation (_booking.place_hold_now), which
+    # alerts staff itself, so no reservation is returned here.
     return {"answer": text, "handoff": handoff, "reservation": None}

@@ -1,18 +1,20 @@
 """
-Email-confirmed reservations.
+Reservations placed from the chat, and the payment email that follows.
 
 Flow:
-  1. In chat, prepare_reservation (in _rag.py) checks the live rate, then calls
-     start_email_confirmation(): the details are saved in Redis under a random
-     token, and the guest is emailed a summary with a Confirm button.
-  2. The button opens GET /api/confirm?token=..., a page showing the summary
-     with one more Confirm button. Email security scanners open links
-     automatically, so only the button on that page (a POST) books anything.
-  3. POST /api/confirm calls place_hold(): price and availability are checked
-     again, the reservation is saved ON HOLD in the PMS with its holdTill
-     deadline, the guest is emailed the result, and staff are alerted.
+  1. In chat, review_reservation (in _rag.py) checks the live rate and shows
+     the guest a summary. When they reply YES (checked in code), the chat
+     calls place_hold_now() here.
+  2. place_hold_now() checks price and availability again, saves the booking
+     in the PMS and blocks it until its holdTill deadline, then emails the
+     guest a payment email with a "View payment details" button, and alerts
+     staff.
+  3. The button opens GET /api/pay?token=... (api/pay.py): the amount due
+     (a minimum down payment, or the full stay) and the bank details to pay
+     to. It changes nothing in the PMS; staff confirm payments themselves.
 
-Each token works once and expires after CONFIRM_LINK_HOURS.
+While PAYMENT_DETAILS_ARE_DUMMY is true (the default), the bank details are
+placeholders and the page says plainly not to transfer anything.
 """
 import html
 import json
@@ -38,8 +40,14 @@ HOTEL_NAME = "Casa Alon Hotel"
 FRONT_DESK = "+63 917 000 0000"
 HOTEL_TIMEZONE = ZoneInfo("Asia/Manila")
 
-CONFIRM_LINK_HOURS = int(os.getenv("CONFIRM_LINK_HOURS", "24"))
-MAX_CONFIRM_EMAILS_PER_GUEST_PER_DAY = int(os.getenv("MAX_CONFIRM_EMAILS_PER_GUEST_PER_DAY", "3"))
+# Down payment: the guest pays at least this share of the total, or the full stay.
+MIN_DOWN_PAYMENT_PERCENT = float(os.getenv("MIN_DOWN_PAYMENT_PERCENT", "10"))
+# Bank details shown on the payment page. Placeholders until real ones are set.
+PAYMENT_DETAILS_ARE_DUMMY = os.getenv("PAYMENT_DETAILS_ARE_DUMMY", "true").lower() == "true"
+PAYMENT_BANK_NAME = os.getenv("PAYMENT_BANK_NAME", "Sample Bank (dummy)")
+PAYMENT_ACCOUNT_NAME = os.getenv("PAYMENT_ACCOUNT_NAME", "Casa Alon Hotel (dummy account)")
+PAYMENT_ACCOUNT_NUMBER = os.getenv("PAYMENT_ACCOUNT_NUMBER", "0000-0000-0000")
+DUMMY_WARNING = "This is a dummy account. Do not transfer anything."
 MAX_BOOKINGS_PER_GUEST_PER_DAY = int(os.getenv("MAX_BOOKINGS_PER_GUEST_PER_DAY", "2"))
 STAFF_WEBHOOK_URL = os.getenv("STAFF_WEBHOOK_URL", "")
 
@@ -88,50 +96,48 @@ def public_base_url() -> str:
 
 
 # ------------------------------------------------------------------
-# Confirmation tokens (Redis)
+# Payment page links (Redis): each held reservation gets a random token
 # ------------------------------------------------------------------
 def _key(token: str) -> str:
-    return f"casaalon:confirm:{token}"
+    return f"casaalon:pay:{token}"
 
 
 def _require_redis():
     r = memory._redis()
     if not r:
-        raise RuntimeError("Redis is required for email confirmations")
+        raise RuntimeError("Redis is required for payment page links")
     return r
 
 
-def get_confirmation(token: str) -> dict | None:
+def payment_amounts(total: float) -> tuple[float, float]:
+    """(minimum down payment, full amount)."""
+    minimum = round(total * MIN_DOWN_PAYMENT_PERCENT / 100, 2)
+    return minimum, round(total, 2)
+
+
+def save_payment(p: dict, result: pms.ReservationResult) -> str:
+    """Store what the payment page shows, until a few days after the hold ends."""
+    token = secrets.token_urlsafe(24)
+    hold = date.fromisoformat(result.hold_till) if result.hold_till else today()
+    seconds = max(86400, int((datetime.combine(hold, datetime.min.time(), HOTEL_TIMEZONE)
+                              - datetime.now(HOTEL_TIMEZONE)).total_seconds()) + 3 * 86400)
+    record = {**p, "total": result.total_price, "currency": result.currency,
+              "room_type": result.room_type, "rate_plan": result.rate_plan,
+              "hold_till": result.hold_till,
+              "reference": ", ".join(result.reservation_codes) or result.order_id}
+    _require_redis().set(_key(token), json.dumps(record, default=str), ex=seconds)
+    return token
+
+
+def get_payment(token: str) -> dict | None:
     if not token or len(token) > 100:
         return None
     try:
         raw = _require_redis().get(_key(token))
         return json.loads(raw) if raw else None
     except Exception:
-        log.exception("Could not read confirmation %s", token[:8])
+        log.exception("Could not read payment link %s", token[:8])
         return None
-
-
-def is_claimed(token: str) -> bool:
-    try:
-        return bool(_require_redis().get(_key(token) + ":claimed"))
-    except Exception:
-        return False
-
-
-def _claim(token: str) -> bool:
-    """True for the first caller only, so a double click can't book twice."""
-    r = _require_redis()
-    return bool(r.set(_key(token) + ":claimed", "1", nx=True, ex=CONFIRM_LINK_HOURS * 3600))
-
-
-def _count_email(thread: str) -> int:
-    r = _require_redis()
-    key = f"casaalon:confirm_emails:{thread}:{today().isoformat()}"
-    count = r.incr(key)
-    if count == 1:
-        r.expire(key, 86400)
-    return int(count)
 
 
 # ------------------------------------------------------------------
@@ -209,54 +215,43 @@ def _email_shell(title: str, body_html: str) -> str:
 </td></tr></table></td></tr></table></body></html>"""
 
 
-def _confirmation_request_email(p: dict, link: str) -> tuple[str, str, str]:
-    rows = summary_rows(p, p.get("hold_till"))
-    subject = f"Confirm your reservation at {HOTEL_NAME}"
+def _payment_email(p: dict, result: pms.ReservationResult, link: str) -> tuple[str, str, str]:
+    rows = summary_rows(p, result.hold_till or None)
+    reference = ", ".join(result.reservation_codes) or result.order_id
+    if reference:
+        rows.insert(0, ("Reference", reference))
+    minimum, full = payment_amounts(result.total_price)
+    cur = result.currency
+    deadline = f"{date.fromisoformat(result.hold_till):%B %d, %Y}" if result.hold_till else "as soon as possible"
+    pct = f"{MIN_DOWN_PAYMENT_PERCENT:g}%"
+    subject = f"Your room is on hold at {HOTEL_NAME}: payment details"
+    dummy_text = f"\n\nNote: {DUMMY_WARNING}\n" if PAYMENT_DETAILS_ARE_DUMMY else ""
     text = (
-        f"Hi {p['guest']['first_name']},\n\n"
-        "Here are the details of the reservation you asked for. Nothing is held yet.\n\n"
+        f"Hi {p['guest']['first_name']},\n\nYour room is on hold. It is not confirmed yet.\n\n"
         f"{_rows_text(rows)}\n\n"
-        f"To place this reservation on hold, open this link within {CONFIRM_LINK_HOURS} hours:\n{link}\n\n"
-        "The down payment must be made by the \"Held until\" date, or the room is released. "
-        "No payment is collected online.\n\n"
-        "If you didn't ask for this, you can ignore this email.\n"
+        f"To keep it, make a down payment by {deadline}, or the room is released:\n"
+        f"- Minimum ({pct}): {cur} {minimum:,.2f}\n- Or pay in full: {cur} {full:,.2f}\n\n"
+        f"See where to pay: {link}{dummy_text}\n"
+        "Our team confirms your reservation once the payment is received.\n"
     )
+    dummy_html = (f'<p style="background:#FBEDE9;color:#8A2E1F;padding:10px 12px;border-radius:6px;'
+                  f'font-size:14px"><strong>{html.escape(DUMMY_WARNING)}</strong></p>'
+                  if PAYMENT_DETAILS_ARE_DUMMY else "")
     body = (
         f"<p style=\"color:#122321\">Hi {html.escape(p['guest']['first_name'])},</p>"
-        "<p style=\"color:#122321\">Here are the details of the reservation you asked for. "
-        "<strong>Nothing is held yet.</strong></p>"
+        "<p style=\"color:#122321\">Your room is <strong>on hold</strong>. It is not confirmed yet.</p>"
         f'<table role="presentation" style="margin:12px 0;font-size:14px">{_rows_html(rows)}</table>'
+        f"<p style=\"color:#122321;font-size:14px\">To keep it, make a down payment by "
+        f"<strong>{html.escape(deadline)}</strong>, or the room is released:</p>"
+        f'<table role="presentation" style="margin:4px 0 12px;font-size:14px">'
+        f'{_rows_html([(f"Minimum ({pct})", f"{cur} {minimum:,.2f}"), ("Or pay in full", f"{cur} {full:,.2f}")])}'
+        "</table>"
         f'<p style="margin:20px 0"><a href="{html.escape(link)}" style="background:{ACCENT_COLOR};color:#122321;'
         'text-decoration:none;padding:12px 22px;border-radius:999px;display:inline-block;font-weight:bold">'
-        "Confirm my reservation</a></p>"
-        f"<p style=\"color:#122321;font-size:14px\">The link works for {CONFIRM_LINK_HOURS} hours. "
-        "The down payment must be made by the \"Held until\" date, or the room is released. "
-        "No payment is collected online.</p>"
-        "<p style=\"color:#5b6b6c;font-size:13px\">If you didn't ask for this, you can ignore this email.</p>"
-    )
-    return subject, text, _email_shell("Please confirm your reservation", body)
-
-
-def _on_hold_email(p: dict, result: pms.ReservationResult) -> tuple[str, str, str]:
-    rows = summary_rows(p, result.hold_till or None)
-    number = ", ".join(result.reservation_codes) or result.order_id
-    if number:
-        rows.insert(0, ("Reference", number))
-    deadline = (f"{date.fromisoformat(result.hold_till):%B %d, %Y}" if result.hold_till else "")
-    subject = f"Your room is on hold at {HOTEL_NAME}"
-    pay_line = (f"Please make the down payment by {deadline}, or the room is released. "
-                if deadline else "Please make the down payment as soon as possible. ")
-    text = (
-        f"Hi {p['guest']['first_name']},\n\nYour room is now ON HOLD. It is not confirmed yet.\n\n"
-        f"{_rows_text(rows)}\n\n{pay_line}"
-        "Our team will contact you by email or mobile with the payment details.\n"
-    )
-    body = (
-        f"<p style=\"color:#122321\">Hi {html.escape(p['guest']['first_name'])},</p>"
-        "<p style=\"color:#122321\">Your room is now <strong>on hold</strong>. It is not confirmed yet.</p>"
-        f'<table role="presentation" style="margin:12px 0;font-size:14px">{_rows_html(rows)}</table>'
-        f"<p style=\"color:#122321;font-size:14px\">{html.escape(pay_line)}"
-        "Our team will contact you by email or mobile with the payment details.</p>"
+        "View payment details</a></p>"
+        f"{dummy_html}"
+        "<p style=\"color:#122321;font-size:14px\">Our team confirms your reservation once the payment "
+        "is received.</p>"
     )
     return subject, text, _email_shell("Your room is on hold", body)
 
@@ -330,7 +325,8 @@ def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None =
         lines += ["", "Check StayGrid: a temporary reservation may have been created under this guest's name. "
                       "Contact the guest to complete or cancel it."]
     elif event == "reservation":
-        lines += ["", "No payment was collected. Contact the guest with the down payment details."]
+        lines += ["", "No payment was collected. The guest was emailed the payment details (unless noted "
+                      "above). Confirm the reservation in StayGrid once the down payment arrives."]
     else:
         lines += ["", "Contact the guest to help them book."]
     lines += ["", f"Chat session: {thread}"]
@@ -370,70 +366,20 @@ def notify_handoff(thread: str, question: str, answer: str) -> None:
 
 
 # ------------------------------------------------------------------
-# Step 1 (from chat): save the request and email the guest
+# Placing the hold (called from the chat after the guest replies YES)
 # ------------------------------------------------------------------
-def start_email_confirmation(p: dict) -> str:
-    """Save the reservation request and email the guest a confirm link.
-    Returns a short status for the chat agent (starts with ERROR on failure)."""
-    base = public_base_url()
-    if not base:
-        log.error("PUBLIC_BASE_URL is not set, so no confirm link can be built")
-        return f"ERROR: email confirmation is not set up. Give the front desk contact {FRONT_DESK} and hand off."
-    if not email_configured():
-        log.error("SMTP_USER / SMTP_PASSWORD are not set")
-        return f"ERROR: email confirmation is not set up. Give the front desk contact {FRONT_DESK} and hand off."
-    try:
-        if _count_email(p["thread"]) > MAX_CONFIRM_EMAILS_PER_GUEST_PER_DAY:
-            return "ERROR: too many confirmation emails have been sent for this guest today. Hand off to staff."
-        token = secrets.token_urlsafe(24)
-        _require_redis().set(_key(token), json.dumps(p, default=str), ex=CONFIRM_LINK_HOURS * 3600)
-    except Exception:
-        log.exception("Could not save the reservation request")
-        return f"ERROR: the reservation request could not be saved. Give the front desk contact {FRONT_DESK} and hand off."
-
-    link = f"{base}/api/confirm?token={token}"
-    try:
-        send_email(p["guest"]["email"], *_confirmation_request_email(p, link))
-    except Exception:
-        log.exception("Could not send the confirmation email to %s", p["guest"]["email"])
-        return (f"ERROR: the confirmation email could not be sent. Ask the guest to double-check their email "
-                f"address, or give the front desk contact {FRONT_DESK} and hand off.")
-    log.info("Confirmation email sent for %s", p["thread"])
-    return "OK"
-
-
-# ------------------------------------------------------------------
-# Step 3 (from the confirm page): place the hold
-# ------------------------------------------------------------------
-def place_hold(token: str) -> tuple[bool, str, str]:
-    """Returns (success, page title, page message)."""
-    p = get_confirmation(token)
-    if not p:
-        return False, "This link has expired", (
-            f"Confirmation links work for {CONFIRM_LINK_HOURS} hours. Please start a new reservation in our chat, "
-            f"or contact our front desk at {FRONT_DESK}.")
-    try:
-        if not _claim(token):
-            return False, "Already confirmed", (
-                "This reservation request has already been used. Check your email for the result, "
-                f"or contact our front desk at {FRONT_DESK}.")
-    except Exception:
-        log.exception("Could not claim confirmation %s", token[:8])
-        return False, "Something went wrong", f"Please try again later, or contact our front desk at {FRONT_DESK}."
-
+def place_hold_now(p: dict) -> str:
+    """Place the hold and email the payment details. Returns the result for the
+    chat agent: starts with RESERVATION ON HOLD, HOLD BEING FINALIZED, or ERROR."""
     thread = p["thread"]
     ci, co = date.fromisoformat(p["check_in"]), date.fromisoformat(p["check_out"])
-    # The hold starts now, so the deadline is worked out from today's date.
     hold_till = hold_deadline(ci, today())
     if hold_till is None:
-        notify_staff("book_and_buy", p, "Guest confirmed too close to arrival for a hold")
-        return False, "Please contact our front desk", (
-            "Your arrival is now within 2 days, so this booking needs full payment and can't be held. "
-            f"Please contact our front desk at {FRONT_DESK} to book.")
+        return ("ERROR: BOOK_AND_BUY. Arrival is within 2 days, so this booking can't be placed on hold. "
+                f"Tell the guest it needs full payment at booking and hand off to the front desk ({FRONT_DESK}).")
     if memory.recent_booking_count(thread) >= MAX_BOOKINGS_PER_GUEST_PER_DAY:
         notify_staff("booking_limit", p, "Daily chat booking limit reached")
-        return False, "Please contact our front desk", (
-            f"We couldn't place this hold automatically. Please contact our front desk at {FRONT_DESK}.")
+        return "ERROR: this guest has reached the daily limit for chat reservations. Hand off to staff."
 
     try:
         result = pms.get_client().create_reservation(
@@ -442,56 +388,58 @@ def place_hold(token: str) -> tuple[bool, str, str]:
             hold_till=hold_till,
         )
     except pms.PriceChangedError as e:
-        return False, "The price has changed", (
-            f"The total is now {e.currency} {e.new_total:,.2f}, so nothing was held. "
-            f"Please start again in our chat, or contact our front desk at {FRONT_DESK}.")
+        return (f"ERROR: the price changed to {e.currency} {e.new_total:,.2f}. Nothing was booked. "
+                "Tell the guest the new total and ask if they still want it.")
+    except pms.NotAvailableError:
+        return "ERROR: that room just became unavailable. Nothing was booked. Offer to check other rooms."
     except pms.PMSUncertainError as e:
-        # The request may have created the reservation, so never tell the guest it
-        # failed (they'd book again) or that it's held (it may not be). Staff check.
+        # The booking may exist (or exists, but couldn't be blocked until the hold
+        # date), so never tell the guest it failed, or that it's held. Staff check.
         log.warning("Hold outcome unknown for %s: %s", thread, e)
         memory.record_booking(thread)
         if isinstance(e, pms.HoldNotAppliedError):
-            # Saved as Temp Reserved, which expires on Hotelogix's short default.
             notify_staff("hold_not_applied", p, f"{e}"[:500],
                          reservation={"order_id": e.order_id, "reservation_codes": e.codes,
-                                      "hold_till": p.get("hold_till")})
+                                      "hold_till": hold_till.isoformat()})
         else:
             notify_staff("booking_uncertain", p, f"{type(e).__name__}: {e}"[:500])
-        return False, "We're finishing your hold", (
-            "Your request reached our reservation system, but it was slow to confirm. "
-            "Our team will check your hold and contact you by email or mobile. "
-            "Please don't send the request again.")
-    except pms.NotAvailableError:
-        return False, "The room is no longer available", (
-            "That room was just booked by someone else, so nothing was held. "
-            f"Please check other rooms in our chat, or contact our front desk at {FRONT_DESK}.")
+        return ("HOLD BEING FINALIZED. The reservation reached the hotel system but the hold couldn't be "
+                "completed automatically. Tell the guest our team is finishing their hold and will contact "
+                "them by email or mobile with the payment details. Do not say the room is held, and do not "
+                "ask them to try again.")
     except Exception as e:
         log.exception("Placing the hold failed for %s", thread)
         notify_staff("booking_failed", p, f"{type(e).__name__}: {e}"[:500])
-        message = ("Our team has been alerted and will check it and contact you. "
-                   f"You can also reach our front desk at {FRONT_DESK}.")
-        # TEMPORARY troubleshooting aid, same switch as the chat: shows the real
-        # error on the page. Turn CHAT_DEBUG off once fixed.
-        if os.getenv("CHAT_DEBUG", "false").lower() == "true":
-            message += f" [Debug: {type(e).__name__}: {e}]"[:900]
-        return False, "We couldn't complete this", message
+        return ("ERROR: the reservation could not be completed. Do not tell the guest it is booked. "
+                f"Give the front desk contact {FRONT_DESK} and hand off.")
 
-    # The request stays in Redis until it expires (the claim blocks reuse), so a
-    # second click shows "already confirmed" instead of "expired".
     memory.record_booking(thread)
     reservation = asdict(result)
-    notify_staff("reservation", p, reservation=reservation)
+    note = ""
     try:
-        send_email(p["guest"]["email"], *_on_hold_email(p, result))
-    except Exception:
-        log.exception("Could not send the on-hold email to %s", p["guest"]["email"])
+        base = public_base_url()
+        if not base:
+            raise RuntimeError("PUBLIC_BASE_URL is not set")
+        link = f"{base}/api/pay?token={save_payment(p, result)}"
+        send_email(p["guest"]["email"], *_payment_email(p, result, link))
+        emailed = True
+    except Exception as e:
+        log.exception("Could not send the payment email for %s", thread)
+        note = f"The payment email could not be sent ({type(e).__name__}); send the guest the payment details."
+        emailed = False
+    notify_staff("reservation", p, note, reservation=reservation)
 
+    minimum, full = payment_amounts(result.total_price)
+    reference = ", ".join(result.reservation_codes) or result.order_id
     deadline = f"{date.fromisoformat(result.hold_till):%B %d, %Y}" if result.hold_till else ""
-    number = ", ".join(result.reservation_codes) or result.order_id
-    message = "Your room is now on hold. It is not confirmed yet."
-    if number:
-        message += f" Your reference number is {number}."
-    if deadline:
-        message += f" Please make the down payment by {deadline}, or the room is released."
-    message += " We've emailed you the details, and our team will contact you with the payment details."
-    return True, "Your room is on hold", message
+    return (
+        "RESERVATION ON HOLD."
+        + (f" Reference number: {reference}." if reference else "")
+        + f" {result.room_type}, total {result.currency} {result.total_price:,.2f}."
+        + (f" Held until {deadline}: the room is released if the down payment isn't made by then." if deadline else "")
+        + f" Down payment: at least {MIN_DOWN_PAYMENT_PERCENT:g}% ({result.currency} {minimum:,.2f}), "
+          f"or the full {result.currency} {full:,.2f}."
+        + (f" The payment details were emailed to {p['guest']['email']}." if emailed
+           else " The payment email could not be sent; say our team will send the payment details.")
+        + " Tell the guest the room is on hold, NOT confirmed: our team confirms it once the payment is received."
+    )
