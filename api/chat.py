@@ -32,6 +32,7 @@ import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+import _booking as booking
 import _rag as rag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -90,26 +91,6 @@ def _origin_allowed(request: Request) -> bool:
     return origin.rstrip("/").endswith(request.headers.get("host", "\0"))
 
 
-def notify_staff(channel: str, user_id: str, question: str, answer: str,
-                 event: str = "handoff", reservation: dict | None = None) -> None:
-    log.info("Staff alert (%s): %s:%s", event, channel, user_id)
-    if not STAFF_WEBHOOK_URL:
-        return
-    payload = {
-        "event": event, "channel": channel, "user_id": user_id,
-        "question": question, "bot_answer": answer, "reservation": reservation,
-    }
-    try:
-        requests.post(
-            STAFF_WEBHOOK_URL,
-            data=json.dumps(payload, default=str),
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-    except requests.RequestException:
-        log.exception("Could not reach STAFF_WEBHOOK_URL")
-
-
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
@@ -153,11 +134,9 @@ def chat(req: ChatRequest, request: Request, background: BackgroundTasks):
             detail = f"{type(e).__name__}: {e}"[:800]
         raise HTTPException(status_code=503, detail=detail)
 
-    if result.get("reservation"):
-        background.add_task(notify_staff, "web", req.session_id, text, result["answer"],
-                            "reservation", result["reservation"])
+    # Holds are placed (and alerted) from the email confirm page, so only handoffs alert here.
     if result["handoff"]:
-        background.add_task(notify_staff, "web", req.session_id, text, result["answer"])
+        background.add_task(booking.notify_handoff, f"web:{req.session_id}", text, result["answer"])
     return result
 
 

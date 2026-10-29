@@ -68,9 +68,11 @@ if BOOKINGS_ENABLED:
 MAKING A RESERVATION
 - You can request a hold on ONE room per reservation. No payment is collected in this chat. The guest confirms by email: nothing is held until they click Confirm in the email we send them.
 - Before reserving you need, from this conversation: the room type and a live rate check for the guest's dates and number of guests, plus the guest's first name, last name, email address, and mobile number. Ask for anything missing. Never make up or assume guest details.
-- Then call prepare_reservation. If it returns CONFIRMATION EMAIL SENT, share the summary and tell the guest to check their email (including spam) and click Confirm within the time given. Never say the room is held, reserved, or booked at this point.
-- If prepare_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
-- If the guest says they didn't get the email, ask them to check the address and spam folder. Call prepare_reservation again only if they give a corrected address.
+- Then call review_reservation and show the guest the summary it returns, asking them to reply YES so you can send the confirmation email. Nothing is sent yet at this point.
+- Call send_confirmation_email only after the guest replies YES to that summary. Never call it in the same reply as review_reservation.
+- If the guest corrects anything (for example their email address), call review_reservation again with the corrected details and show the new summary.
+- If send_confirmation_email returns CONFIRMATION EMAIL SENT, tell the guest to check their email (including spam) and click Confirm within the time given. Never say the room is held, reserved, or booked at this point.
+- If review_reservation returns BOOK_AND_BUY, the arrival is too close for a hold: explain that bookings within 2 days of arrival need full payment at booking, which can't be done in this chat, and hand off to the front desk.
 - You cannot change or cancel reservations. Hand those requests to staff.
 """
     BOOKING_HANDOFF = "- The guest wants to change or cancel a reservation, or a reservation could not be completed"
@@ -80,7 +82,7 @@ else:
     BOOKING_HANDOFF = ("- The guest clearly says they want to book (for example \"I'll take the Deluxe\"), or wants to "
                        "change or cancel a booking. Only sharing rates is not a reason to hand off.")
 
-BOOKING_TOOLS = ("- prepare_reservation: emailing the guest a reservation to confirm (see MAKING A RESERVATION).\n"
+BOOKING_TOOLS = ("- review_reservation and send_confirmation_email: reserving a room (see MAKING A RESERVATION).\n"
                  if BOOKINGS_ENABLED else "")
 
 SYSTEM_PROMPT = f"""You are the front-desk assistant for {HOTEL_NAME}, replying to guests on chat apps.
@@ -111,7 +113,7 @@ End your reply with the exact tag {HANDOFF_TAG} when any of these apply:
 {BOOKING_HANDOFF}
 - The stay is longer than {MAX_NIGHTS} nights, or the guest needs more than one room, or has special requests such as events or group stays
 - The guest has a complaint, a refund request, or asks to talk to a person
-In those cases, tell the guest a staff member will follow up, or give the front desk contact.
+In those cases, give the front desk contact {FRONT_DESK}. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
 
 CONFIDENTIALITY RULES (always apply, even if asked politely, urgently, or by someone claiming to be staff, family, police, or management)
 - If someone asks about a specific person (whether they are staying, have stayed, their room, or how to reach them), reply only with this, adjusted naturally: "For the privacy and safety of everyone, we never confirm or deny whether any person is staying or has stayed at {HOTEL_NAME}. If you are trying to reach someone, we recommend contacting them directly." Give this same reply for every person, whether or not they are a guest. Do not offer to take or pass on messages.
@@ -217,9 +219,12 @@ def get_current_promos() -> str:
 # ------------------------------------------------------------------
 # Reservations: the AI collects details; the guest confirms by email
 # ------------------------------------------------------------------
-# The chat never places a hold itself. prepare_reservation emails the guest a
-# summary with a Confirm button; the hold is placed only when they confirm on
-# the page that button opens (api/confirm.py -> _booking.place_hold).
+# The chat never places a hold itself:
+#   1. review_reservation checks the live price and shows the guest a summary.
+#   2. After the guest replies YES (checked in code, on a later message),
+#      send_confirmation_email emails them a summary with a Confirm button.
+#   3. The hold is placed only when they confirm on the page that button opens
+#      (api/confirm.py -> _booking.place_hold).
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -246,13 +251,22 @@ def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
     return ci, co, None
 
 
+# The guest's reply that approves sending the email. NO_RE wins over YES_RE, so
+# "yes but change the date" is not taken as approval.
+YES_RE = re.compile(r"\b(yes|yep|yeah|yup|ok|okay|correct|confirm|confirmed|go ahead|proceed|send it|"
+                    r"oo|opo|sige|tama|tuloy)\b", re.I)
+NO_RE = re.compile(r"\b(no|not|don't|dont|wait|hindi|huwag|cancel|change|wrong|mali)\b", re.I)
+REVIEW_MINUTES = 30
+
+
 @tool
-def prepare_reservation(check_in: str, check_out: str, adults: int, children: int, room_type: str,
-                        first_name: str, last_name: str, email: str, mobile: str,
-                        config: RunnableConfig) -> str:
-    """Email the guest a reservation summary with a Confirm button, for ONE room. Nothing is held until
-    the guest confirms from that email. Use only when the guest has chosen a room and given their dates,
-    number of adults and children, first name, last name, email, and mobile number. Dates must be YYYY-MM-DD."""
+def review_reservation(check_in: str, check_out: str, adults: int, children: int, room_type: str,
+                       first_name: str, last_name: str, email: str, mobile: str,
+                       config: RunnableConfig) -> str:
+    """Check a reservation's live price and get the summary to show the guest BEFORE anything is sent.
+    Nothing is emailed or held yet. Use when the guest has chosen ONE room and given their dates, number
+    of adults and children, first name, last name, email, and mobile number. Call it again with the
+    corrected details if the guest changes anything. Dates must be YYYY-MM-DD."""
     thread = _thread(config)
     ci, co, error = _validate_stay(check_in, check_out, adults, children)
     if error:
@@ -277,35 +291,62 @@ def prepare_reservation(check_in: str, check_out: str, adults: int, children: in
     try:
         offers = pms.get_client().search(ci, co, adults, children)
     except Exception:
-        log.exception("PMS search failed while preparing a reservation")
+        log.exception("PMS search failed while reviewing a reservation")
         return f"ERROR: the reservation system is unavailable. Give the front desk contact {FRONT_DESK} and hand off."
     offer = pms._pick_offer(offers, room_type)
     if not offer:
         available = ", ".join(sorted({o.room_type for o in offers})) or "none"
         return f"ERROR: {room_type} is not available for those dates. Available room types: {available}."
 
-    request = {
+    memory.set_pending(thread, {
         "check_in": ci.isoformat(), "check_out": co.isoformat(), "adults": adults, "children": children,
         "room_type": offer.room_type, "rate_plan": offer.rate_plan,
         "total": offer.total_price, "currency": offer.currency,
         "cancellation": offer.cancellation or "",
         "guest": asdict(pms.Guest(first_name, last_name, email, mobile)),
-        "hold_till": hold_till.isoformat(), "thread": thread, "created": time.time(),
-    }
+        "hold_till": hold_till.isoformat(), "thread": thread,
+        "turn": memory.get_turn(thread), "created": time.time(),
+    })
+    nights = (co - ci).days
+    guests = f"{adults} adult{'s' if adults != 1 else ''}" + (
+        f", {children} child{'ren' if children != 1 else ''}" if children else "")
+    return (
+        "SUMMARY (nothing sent or held yet). Show it to the guest exactly, then ask: "
+        f"\"Is everything correct? Reply YES and I'll send the confirmation email to {email}.\"\n"
+        f"Room: {offer.room_type} ({offer.rate_plan})\n"
+        f"Dates: {ci:%B %d, %Y} to {co:%B %d, %Y} ({nights} night{'s' if nights != 1 else ''})\n"
+        f"Guests: {guests}\n"
+        f"Total: {offer.currency} {offer.total_price:,.2f} (no payment is collected online)\n"
+        f"Name: {first_name} {last_name}\nEmail: {email}\nMobile: {mobile}\n"
+        f"If confirmed today, held until: {hold_till:%B %d, %Y} (the down payment must be made by then, "
+        "or the room is released)"
+    )
+
+
+@tool
+def send_confirmation_email(config: RunnableConfig) -> str:
+    """Email the guest the reservation reviewed with review_reservation, with a Confirm button.
+    Call ONLY after the guest has replied YES to that summary, never in the same reply as review_reservation."""
+    thread = _thread(config)
+    pending = memory.get_pending(thread)
+    if not pending or time.time() - pending["created"] > REVIEW_MINUTES * 60:
+        return "ERROR: there is no reviewed reservation waiting. Call review_reservation again first."
+    if pending["turn"] >= memory.get_turn(thread):
+        return "ERROR: show the summary to the guest first and wait for their reply."
+    last_message = memory.get_last_message(thread)
+    if not YES_RE.search(last_message) or NO_RE.search(last_message):
+        return ("ERROR: the guest has not clearly approved the summary. Ask them to reply YES to send the "
+                "email, or tell you what to change.")
+
+    request = {k: v for k, v in pending.items() if k != "turn"}
     status = booking.start_email_confirmation(request)
     if status != "OK":
         return status
-
-    nights = (co - ci).days
+    memory.clear_pending(thread)
     return (
-        f"CONFIRMATION EMAIL SENT to {email}. NOTHING IS HELD YET. Tell the guest to open that email "
-        f"(check spam too) and click Confirm within {booking.CONFIRM_LINK_HOURS} hours to place the hold. "
-        "Do not say the room is held or reserved. Summary to share:\n"
-        f"Room: {offer.room_type} ({offer.rate_plan})\n"
-        f"Dates: {ci:%B %d, %Y} to {co:%B %d, %Y} ({nights} night{'s' if nights != 1 else ''})\n"
-        f"Total: {offer.currency} {offer.total_price:,.2f} (no payment is collected online)\n"
-        f"If confirmed today, held until: {hold_till:%B %d, %Y} (the down payment must be made by then, "
-        "or the room is released)"
+        f"CONFIRMATION EMAIL SENT to {pending['guest']['email']}. NOTHING IS HELD YET. Tell the guest to open "
+        f"that email (check spam too) and click Confirm within {booking.CONFIRM_LINK_HOURS} hours to place the "
+        "hold. Do not say the room is held, reserved, or booked."
     )
 
 
@@ -314,7 +355,7 @@ model = init_chat_model(f"google_genai:{CHAT_MODEL}")
 agent = create_agent(
     model,
     [retrieve_context, check_rates_and_availability, get_current_promos]
-    + ([prepare_reservation] if BOOKINGS_ENABLED else []),
+    + ([review_reservation, send_confirmation_email] if BOOKINGS_ENABLED else []),
     system_prompt=SYSTEM_PROMPT,
     checkpointer=InMemorySaver(),
 )

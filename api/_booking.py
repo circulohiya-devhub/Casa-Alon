@@ -50,6 +50,9 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "") or SMTP_USER
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", HOTEL_NAME)
+# Where staff alerts (handoffs, holds placed, failures) are emailed.
+# Defaults to the sending account itself, so alerts never silently go nowhere.
+STAFF_ALERT_EMAIL = os.getenv("STAFF_ALERT_EMAIL", "") or EMAIL_FROM
 
 BRAND_COLOR = "#1F3A3D"
 ACCENT_COLOR = "#C9962C"
@@ -259,21 +262,96 @@ def _on_hold_email(p: dict, result: pms.ReservationResult) -> tuple[str, str, st
 
 
 # ------------------------------------------------------------------
-# Staff alerts
+# Staff alerts: emailed to STAFF_ALERT_EMAIL, and posted to STAFF_WEBHOOK_URL if set
 # ------------------------------------------------------------------
-def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None = None) -> None:
-    thread = p.get("thread", "")
-    log.info("Staff alert (%s): %s", event, thread)
+ALERT_SUBJECTS = {
+    "reservation": "On-hold reservation placed",
+    "booking_failed": "ACTION NEEDED: a chat reservation failed",
+    "book_and_buy": "ACTION NEEDED: guest needs a book & buy reservation",
+    "booking_limit": "ACTION NEEDED: guest hit the chat booking limit",
+}
+
+
+def _send_staff_email(subject: str, text: str) -> None:
+    if not (STAFF_ALERT_EMAIL and email_configured()):
+        log.warning("Staff alert not emailed (email not configured): %s", subject)
+        return
+    body = (f'<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;white-space:pre-wrap">'
+            f"{html.escape(text)}</pre>")
+    try:
+        send_email(STAFF_ALERT_EMAIL, f"[Casa Alon chat] {subject}", text, body)
+    except Exception:
+        log.exception("Could not email staff alert: %s", subject)
+
+
+def _post_webhook(payload: dict) -> None:
     if not STAFF_WEBHOOK_URL:
         return
-    channel, _, user_id = thread.partition(":")
-    payload = {"event": event, "channel": channel, "user_id": user_id, "note": note,
-               "request": p, "reservation": reservation}
     try:
         requests.post(STAFF_WEBHOOK_URL, data=json.dumps(payload, default=str),
                       headers={"Content-Type": "application/json"}, timeout=10)
     except requests.RequestException:
         log.exception("Could not reach STAFF_WEBHOOK_URL")
+
+
+def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None = None) -> None:
+    """Alert staff about a reservation request: placed, failed, or needing them."""
+    thread = p.get("thread", "")
+    log.info("Staff alert (%s): %s", event, thread)
+    channel, _, user_id = thread.partition(":")
+    _post_webhook({"event": event, "channel": channel, "user_id": user_id, "note": note,
+                   "request": p, "reservation": reservation})
+
+    g = p.get("guest", {})
+    rows = summary_rows(p, (reservation or {}).get("hold_till") or p.get("hold_till"))
+    lines = [ALERT_SUBJECTS.get(event, event), ""]
+    if reservation:
+        number = ", ".join(reservation.get("reservation_codes") or []) or reservation.get("order_id") or "none returned"
+        lines.append(f"Reference: {number}")
+    lines += [f"{k}: {v}" for k, v in rows]
+    if note:
+        lines += ["", f"Details: {note}"]
+    if event == "booking_failed":
+        lines += ["", "Check StayGrid: a temporary reservation may have been created under this guest's name. "
+                      "Contact the guest to complete or cancel it."]
+    elif event == "reservation":
+        lines += ["", "No payment was collected. Contact the guest with the down payment details."]
+    else:
+        lines += ["", "Contact the guest to help them book."]
+    lines += ["", f"Chat session: {thread}"]
+    subject = f"{ALERT_SUBJECTS.get(event, event)}: {g.get('first_name', '')} {g.get('last_name', '')}".strip()
+    _send_staff_email(subject, "\n".join(lines))
+
+
+def notify_handoff(thread: str, question: str, answer: str) -> None:
+    """Alert staff that a chat guest needs a person, with the recent conversation,
+    so they don't have to ask the guest to repeat themselves."""
+    log.info("Staff alert (handoff): %s", thread)
+    channel, _, user_id = thread.partition(":")
+    _post_webhook({"event": "handoff", "channel": channel, "user_id": user_id,
+                   "question": question, "bot_answer": answer})
+
+    transcript = []
+    for turn in memory.load_history(thread)[-16:]:
+        text = turn["content"]
+        if turn["role"] == "user" and text.startswith("[Today is"):
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+        transcript.append(f"{'Guest' if turn['role'] == 'user' else 'Bot'}: {text}")
+    lines = [
+        "A guest in the website chat needs a person.",
+        "",
+        f"Latest guest message: {question}",
+        f"Bot's reply: {answer}",
+        "",
+        "Website guests can't be messaged back in the chat. Use the contact details in the conversation "
+        "below if the guest gave them; if not, they were given the front desk number.",
+        "",
+        "Recent conversation:",
+        *(transcript or ["(not available)"]),
+        "",
+        f"Chat session: {thread}",
+    ]
+    _send_staff_email(f"Guest needs a person: {question[:60]}", "\n".join(lines))
 
 
 # ------------------------------------------------------------------
@@ -359,9 +437,13 @@ def place_hold(token: str) -> tuple[bool, str, str]:
     except Exception as e:
         log.exception("Placing the hold failed for %s", thread)
         notify_staff("booking_failed", p, f"{type(e).__name__}: {e}"[:500])
-        return False, "We couldn't complete this", (
-            "Our team has been alerted and will check it and contact you. "
-            f"You can also reach our front desk at {FRONT_DESK}.")
+        message = ("Our team has been alerted and will check it and contact you. "
+                   f"You can also reach our front desk at {FRONT_DESK}.")
+        # TEMPORARY troubleshooting aid, same switch as the chat: shows the real
+        # error on the page. Turn CHAT_DEBUG off once fixed.
+        if os.getenv("CHAT_DEBUG", "false").lower() == "true":
+            message += f" [Debug: {type(e).__name__}: {e}]"[:900]
+        return False, "We couldn't complete this", message
 
     # The request stays in Redis until it expires (the claim blocks reuse), so a
     # second click shows "already confirmed" instead of "expired".

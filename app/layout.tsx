@@ -34,7 +34,8 @@ export default function RootLayout({
           data-api-url="/api/chat"
           data-hotel="Casa Alon Hotel"
           data-phone="+63 917 000 0000"
-          data-greeting="Hi, I'm Ask Alon. I can tell you about rooms, rates, amenities, or how to get here — what do you want to know?"
+          data-greeting="Hi! I'm Ask Alon, Casa Alon's AI assistant. I can answer questions about the hotel, check live room rates and availability, and help you request a reservation. What would you like to know?"
+          data-privacy-url="/privacy"
           strategy="afterInteractive"
         />
       </body>
