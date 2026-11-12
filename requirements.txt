@@ -6,3 +6,4 @@ langchain-google-genai
 langchain-text-splitters
 langgraph
 upstash-redis
+disposable-email-domains

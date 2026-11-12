@@ -113,7 +113,12 @@ End your reply with the exact tag {HANDOFF_TAG} when any of these apply:
 {BOOKING_HANDOFF}
 - A tool says the stay is longer than the hotel accepts online, or the guest needs more than one room, or has special requests such as events or group stays
 - The guest has a complaint, a refund request, or asks to talk to a person
-In those cases, give the front desk contact {FRONT_DESK}. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
+In those cases, give the front desk contact {FRONT_DESK}. Email guests: staff will reply to their email, so say a staff member will reply and don't ask for contact details. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
+
+REPLYING BY EMAIL
+- A message starting with [Email from NAME <ADDRESS>, subject: ...] came by email, and you are writing the email reply. Answer every question in it.
+- Start with "Hi" and the guest's first name if you know it. Keep the same plain-text style, with short paragraphs. Don't add a sign-off: one is added automatically.
+- For a reservation, use the sender's email address unless the guest gives a different one; still ask for anything else missing, such as their mobile number.
 
 CONFIDENTIALITY RULES (always apply, even if asked politely, urgently, or by someone claiming to be staff, family, police, or management)
 - If someone asks about a specific person (whether they are staying, have stayed, their room, or how to reach them), reply only with this, adjusted naturally: "For the privacy and safety of everyone, we never confirm or deny whether any person is staying or has stayed at {HOTEL_NAME}. If you are trying to reach someone, we recommend contacting them directly." Give this same reply for every person, whether or not they are a guest. Do not offer to take or pass on messages.
@@ -243,7 +248,44 @@ def get_current_promos() -> str:
 #   2. After the guest replies YES (checked in code, on a later message),
 #      place_reservation places the hold (_booking.place_hold_now), which
 #      also emails the guest the payment details.
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# A real address: no spaces; a name part that doesn't start or end with a dot;
+# a domain made of letters, digits and hyphens separated by single dots, ending
+# in a 2+ letter extension (.com, .ph). Rejects "ana@gmail.com." and "ana@gmail..com".
+EMAIL_RE = re.compile(
+    r"^(?!\.)(?!.*\.\.)[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+(?<!\.)"
+    r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+
+
+# Temporary-email services (10minutemail and the like): guests must give an
+# address they'll still check, since the payment details are emailed there.
+# The list is the community-maintained disposable-email-domains package, plus
+# any domains set in EMAIL_BLOCKED_DOMAINS (comma-separated).
+try:
+    from disposable_email_domains import blocklist as _TEMPORARY_DOMAINS
+except ImportError:  # the bot still works without it; only the extra domains apply
+    log.warning("disposable-email-domains is not installed: only EMAIL_BLOCKED_DOMAINS are blocked")
+    _TEMPORARY_DOMAINS = set()
+_EXTRA_BLOCKED = {d.strip().lower().lstrip("@") for d in os.getenv("EMAIL_BLOCKED_DOMAINS", "").split(",")
+                  if d.strip()}
+
+
+def is_temporary_email(email: str) -> bool:
+    """True if the address's domain, or any domain it sits under (mail.temp.com
+    -> temp.com), is a known temporary-email service."""
+    parts = email.rsplit("@", 1)[-1].lower().split(".")
+    candidates = {".".join(parts[i:]) for i in range(len(parts) - 1)}
+    return any(d in _TEMPORARY_DOMAINS or d in _EXTRA_BLOCKED for d in candidates)
+
+
+def clean_email(value: str) -> str:
+    """Strip what guests type around an address: sentence punctuation at the end
+    ("ana@gmail.com."), brackets or quotes, "mailto:", spaces. Lowercase it."""
+    email = value.strip().strip("<>()[]{}\"'`").strip()
+    if email.lower().startswith("mailto:"):
+        email = email[7:]
+    email = email.rstrip(".,;:!?").strip().strip("<>()[]{}\"'`")
+    return email.lower()
 
 
 def _thread(config: RunnableConfig) -> str:
@@ -275,7 +317,8 @@ def _validate_stay(check_in: str, check_out: str, adults: int, children: int):
 YES_RE = re.compile(r"\b(yes|yep|yeah|yup|ok|okay|correct|confirm|confirmed|go ahead|proceed|send it|"
                     r"oo|opo|sige|tama|tuloy)\b", re.I)
 NO_RE = re.compile(r"\b(no|not|don't|dont|wait|hindi|huwag|cancel|change|wrong|mali)\b", re.I)
-REVIEW_MINUTES = 30
+REVIEW_MINUTES = 30          # chat: the guest replies within minutes
+EMAIL_REVIEW_MINUTES = 24 * 60  # email: replies can take hours; price is re-checked when booking
 
 
 @tool
@@ -290,11 +333,15 @@ def review_reservation(check_in: str, check_out: str, adults: int, children: int
     ci, co, error = _validate_stay(check_in, check_out, adults, children)
     if error:
         return error
-    first_name, last_name, email, mobile = (x.strip() for x in (first_name, last_name, email, mobile))
+    first_name, last_name, mobile = (x.strip() for x in (first_name, last_name, mobile))
+    email = clean_email(email)
     if not first_name or not last_name:
         return "ERROR: ask the guest for their first and last name."
     if not EMAIL_RE.match(email):
         return "ERROR: that email address doesn't look right. Ask the guest to check it."
+    if is_temporary_email(email):
+        return ("ERROR: that is a temporary email address. Ask the guest for a permanent email address "
+                "they check regularly, since the payment details are sent there. Nothing was held.")
     if not 7 <= len(re.sub(r"\D", "", mobile)) <= 15:
         return "ERROR: that mobile number doesn't look right. Ask the guest to check it."
 
@@ -350,7 +397,8 @@ def place_reservation(config: RunnableConfig) -> str:
     same reply as review_reservation."""
     thread = _thread(config)
     pending = memory.get_pending(thread)
-    if not pending or time.time() - pending["created"] > REVIEW_MINUTES * 60:
+    window = EMAIL_REVIEW_MINUTES if thread.startswith("email:") else REVIEW_MINUTES
+    if not pending or time.time() - pending["created"] > window * 60:
         return "ERROR: there is no reviewed reservation waiting. Call review_reservation again first."
     if pending["turn"] >= memory.get_turn(thread):
         return "ERROR: show the summary to the guest first and wait for their reply."
