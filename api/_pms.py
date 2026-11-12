@@ -563,6 +563,7 @@ class HotelogixClient(PMSClient):
                         "payment": {"type": "OTH", "amount": "0",
                                     "description": "Reserved via chatbot - no payment collected"},
                         "errorIfNotConfirm": {"value": 1},
+                        **({} if SEND_HOTELOGIX_EMAIL else {"doNotSendEmail": {"value": 1}}),
                     }, retry=False)
                     status = "CONFIRMED"
                     codes = _find_order(confirmed)[1] or codes
@@ -575,13 +576,18 @@ class HotelogixClient(PMSClient):
                 # change it. Default: the end of the deadline day, hotel local time.
                 hold_value = datetime(hold_till.year, hold_till.month, hold_till.day,
                                       23, 59, 59).strftime(HOLD_TILL_FORMAT)
+                block_request = {
+                    "orderId": {"value": order_id},
+                    "payment": {"type": HOLD_PAYMENT_TYPE, "amount": "0",
+                                "description": "Held via chatbot - awaiting down payment"},
+                    "holdTill": {"value": hold_value},
+                }
+                if not SEND_HOTELOGIX_EMAIL:
+                    # Otherwise Hotelogix emails the guest its own "Booking Confirmation"
+                    # (with the property's real bank details), contradicting ours.
+                    block_request["doNotSendEmail"] = {"value": 1}
                 try:
-                    blocked = self._call("confirmbooking", {
-                        "orderId": {"value": order_id},
-                        "payment": {"type": HOLD_PAYMENT_TYPE, "amount": "0",
-                                    "description": "Held via chatbot - awaiting down payment"},
-                        "holdTill": {"value": hold_value},
-                    }, retry=False)
+                    blocked = self._call("confirmbooking", block_request, retry=False)
                     codes = _find_order(blocked)[1] or codes
                 except PMSError as e:
                     log.exception("Hotelogix could not block order %s until %s", order_id, hold_value)
