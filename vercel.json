@@ -5,6 +5,9 @@
     },
     "api/pay.py": {
       "maxDuration": 30
+    },
+    "api/gmail.py": {
+      "maxDuration": 240
     }
   }
 }

@@ -334,7 +334,7 @@ def notify_staff(event: str, p: dict, note: str = "", reservation: dict | None =
     _send_staff_email(subject, "\n".join(lines))
 
 
-def notify_handoff(thread: str, question: str, answer: str) -> None:
+def notify_handoff(thread: str, question: str, answer: str, contact: str = "", subject: str = "") -> None:
     """Alert staff that a chat guest needs a person, with the recent conversation,
     so they don't have to ask the guest to repeat themselves."""
     log.info("Staff alert (handoff): %s", thread)
@@ -345,17 +345,26 @@ def notify_handoff(thread: str, question: str, answer: str) -> None:
     transcript = []
     for turn in memory.load_history(thread)[-16:]:
         text = turn["content"]
-        if turn["role"] == "user" and text.startswith("[Today is"):
-            text = text.split("\n", 1)[1] if "\n" in text else ""
+        if turn["role"] == "user":
+            # Drop the date and email notes the bot is given ahead of each message
+            while text.startswith("[") and "\n" in text and text.split("\n", 1)[0].endswith("]"):
+                text = text.split("\n", 1)[1]
         transcript.append(f"{'Guest' if turn['role'] == 'user' else 'Bot'}: {text}")
+    if channel == "email":
+        where = ("A guest who emailed the hotel needs a person.",
+                 f"Reply to them in the Gmail thread{f' {chr(34)}{subject}{chr(34)}' if subject else ''}"
+                 f"{f' ({contact})' if contact else ''}. The bot has already replied once.")
+    else:
+        where = ("A guest in the website chat needs a person.",
+                 "Website guests can't be messaged back in the chat. Use the contact details in the "
+                 "conversation below if the guest gave them; if not, they were given the front desk number.")
     lines = [
-        "A guest in the website chat needs a person.",
+        where[0],
         "",
         f"Latest guest message: {question}",
         f"Bot's reply: {answer}",
         "",
-        "Website guests can't be messaged back in the chat. Use the contact details in the conversation "
-        "below if the guest gave them; if not, they were given the front desk number.",
+        where[1],
         "",
         "Recent conversation:",
         *(transcript or ["(not available)"]),

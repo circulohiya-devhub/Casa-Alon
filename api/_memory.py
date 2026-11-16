@@ -32,6 +32,18 @@ log = logging.getLogger("memory")
 HISTORY_TTL_SECONDS = 60 * 60 * 24       # 24 hours, matches the widget's own history TTL
 PENDING_TTL_SECONDS = 60 * 20            # a little past PENDING_MINUTES, as a backstop
 BOOKED_AT_TTL_SECONDS = 60 * 60 * 24     # only need "within the last 24h"
+# Email conversations move slower than chat (guests reply hours or days later),
+# so email threads keep their history and an unanswered summary for longer.
+EMAIL_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7   # 7 days
+EMAIL_PENDING_TTL_SECONDS = 60 * 60 * 25       # a little past the 24h review window
+
+
+def _history_ttl(thread_id: str) -> int:
+    return EMAIL_HISTORY_TTL_SECONDS if thread_id.startswith("email:") else HISTORY_TTL_SECONDS
+
+
+def _pending_ttl(thread_id: str) -> int:
+    return EMAIL_PENDING_TTL_SECONDS if thread_id.startswith("email:") else PENDING_TTL_SECONDS
 MAX_HISTORY_TURNS = 20                   # stored turns (user+assistant pairs count as 2)
 
 _client = None
@@ -95,7 +107,7 @@ def save_history(thread_id: str, turns: list[dict]) -> None:
         return
     try:
         trimmed = turns[-MAX_HISTORY_TURNS:]
-        r.set(_key("history", thread_id), json.dumps(trimmed), ex=HISTORY_TTL_SECONDS)
+        r.set(_key("history", thread_id), json.dumps(trimmed), ex=_history_ttl(thread_id))
     except Exception:
         log.exception("Redis save_history failed for %s", thread_id)
 
@@ -109,7 +121,7 @@ def next_turn(thread_id: str) -> int:
         return 1
     try:
         n = r.incr(_key("turn", thread_id))
-        r.expire(_key("turn", thread_id), HISTORY_TTL_SECONDS)
+        r.expire(_key("turn", thread_id), _history_ttl(thread_id))
         return int(n)
     except Exception:
         log.exception("Redis next_turn failed for %s", thread_id)
@@ -133,7 +145,7 @@ def set_last_message(thread_id: str, text: str) -> None:
     if not r:
         return
     try:
-        r.set(_key("last_message", thread_id), text, ex=HISTORY_TTL_SECONDS)
+        r.set(_key("last_message", thread_id), text, ex=_history_ttl(thread_id))
     except Exception:
         log.exception("Redis set_last_message failed for %s", thread_id)
 
@@ -157,7 +169,7 @@ def set_pending(thread_id: str, data: dict) -> None:
     if not r:
         return
     try:
-        r.set(_key("pending", thread_id), json.dumps(data, default=str), ex=PENDING_TTL_SECONDS)
+        r.set(_key("pending", thread_id), json.dumps(data, default=str), ex=_pending_ttl(thread_id))
     except Exception:
         log.exception("Redis set_pending failed for %s", thread_id)
 
