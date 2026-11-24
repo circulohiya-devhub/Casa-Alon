@@ -8,8 +8,7 @@ cannot change or cancel reservations.
 
 PMS_PROVIDER in .env picks the source:
   mock       sample data for testing without any API (default)
-  hotelogix  the Hotelog
-  ix Web API (sandbox or live, set by HOTELOGIX_BASE_URL)
+  hotelogix  the Hotelogix Web API (sandbox or live, set by HOTELOGIX_BASE_URL)
 """
 import hashlib
 import hmac
@@ -289,7 +288,9 @@ class HotelogixClient(PMSClient):
         # This property's Hotelogix setup rejects savebooking when the guest's
         # address1 is empty. The bot doesn't collect street addresses, so a
         # placeholder is sent; staff can fill in the real one when confirming.
-        self.guest_address = os.getenv("HOTELOGIX_GUEST_ADDRESS", "Not provided (booked via chat)")
+        # Shown in the guest's address in StayGrid, so staff can see where the booking
+        # came from. {channel} becomes e.g. "website chat", "email", "Facebook Messenger".
+        self.guest_address = os.getenv("HOTELOGIX_GUEST_ADDRESS", "Not provided (booked via {channel})")
         # Also required by savebooking (the request schema lists them as mandatory guest
         # fields; an empty city fails with "Column 'city' cannot be null"). The bot
         # doesn't collect them, so placeholders are sent; staff update them if needed.
@@ -480,15 +481,29 @@ class HotelogixClient(PMSClient):
         self._stay_limits = (time.time(), limits)
         return limits
 
-    def _guest_payload(self, guest: Guest) -> dict:
+    CHANNEL_NAMES = {
+        "web": "website chat",
+        "email": "email",
+        "facebook": "Facebook Messenger",
+        "instagram": "Instagram",
+        "whatsapp": "WhatsApp",
+        "viber": "Viber",
+    }
+
+    def _address_for(self, channel: str) -> str:
+        name = self.CHANNEL_NAMES.get((channel or "").lower(), "chat")
+        return self.guest_address.replace("{channel}", name)
+
+    def _guest_payload(self, guest: Guest, channel: str = "") -> dict:
+        address = self._address_for(channel)
         return {
             "fname": {"value": guest.first_name},
             "lname": {"value": guest.last_name},
             "email": {"value": guest.email},
             "mobile": {"value": guest.mobile},
             "phone": {"value": guest.mobile},
-            "address": {"value": self.guest_address},
-            "address1": {"value": self.guest_address},
+            "address": {"value": address},
+            "address1": {"value": address},
             "city": {"value": self.guest_city},
             "state": {"value": self.guest_state},
             "zip": {"value": self.guest_zip},
@@ -521,7 +536,7 @@ class HotelogixClient(PMSClient):
             if not hotel.get("id") or not booking.get("id") or not stays:
                 raise PMSError("Hotelogix addtocart returned no booking")
 
-            guest_payload = self._guest_payload(guest)
+            guest_payload = self._guest_payload(guest, channel)
             # Every guest slot needs guest details: with 2 adults there are 2 slots, and
             # leaving the second one empty makes savebooking fail with HTTP 500.
             gueststays = [{"id": s["id"], "guest": guest_payload} for s in stays if s.get("id")]
