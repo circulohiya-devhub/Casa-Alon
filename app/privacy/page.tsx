@@ -27,6 +27,7 @@ const SECTIONS: { title: string; body: string[] }[] = [
     body: [
       "Your chat messages, so the assistant can answer you and keep track of the conversation.",
       "If you email us: the email's text, your name and email address, and its subject, so the assistant can reply to you in the same email thread.",
+      "If you message our Facebook Page: your messages and your Messenger name, so the assistant can reply to you in Messenger. Messenger is run by Meta, whose own privacy policy also applies.",
       "If you request a reservation: your name, email address, mobile number, travel dates and number of guests, so we can send you a confirmation email, place the room on hold in our reservation system, and contact you about payment.",
       "If you ask for a person: the recent conversation, sent to our staff so they can follow up without asking you to repeat yourself.",
       "We don't collect payment details in the chat.",
@@ -35,13 +36,13 @@ const SECTIONS: { title: string; body: string[] }[] = [
   {
     title: "Who processes it for us",
     body: [
-      "To run the assistant, your information passes through service providers acting on our behalf: Google (the AI model, and the email account our messages are sent from), Hotelogix (our reservation system), Upstash (short-term conversation storage), Vercel (website hosting), and LangChain's LangSmith (service logs we use to check and improve the assistant's answers).",
+      "To run the assistant, your information passes through service providers acting on our behalf: Google (the AI model, and the email account our messages are sent from), Hotelogix (our reservation system), Meta (Facebook Messenger, if you message our Page), Upstash (short-term conversation storage), Vercel (website hosting), and LangChain's LangSmith (service logs we use to check and improve the assistant's answers).",
     ],
   },
   {
     title: "How long we keep it",
     body: [
-      "Chat conversations are kept for 24 hours, in our storage and in your browser. For email, the assistant keeps the conversation for 7 days so it can follow your replies; the emails themselves stay in our email inbox like any other email to the hotel. Unconfirmed reservation requests expire after 24 hours. Reservations placed in our reservation system are kept as part of your booking record. Service logs are kept for a limited period for troubleshooting.",
+      "Chat conversations are kept for 24 hours, in our storage and in your browser. For email and Messenger, the assistant keeps the conversation for 7 days so it can follow your replies; the emails themselves stay in our email inbox like any other email to the hotel. Unconfirmed reservation requests expire after 24 hours. Reservations placed in our reservation system are kept as part of your booking record. Service logs are kept for a limited period for troubleshooting.",
     ],
   },
   {

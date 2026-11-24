@@ -350,7 +350,11 @@ def notify_handoff(thread: str, question: str, answer: str, contact: str = "", s
             while text.startswith("[") and "\n" in text and text.split("\n", 1)[0].endswith("]"):
                 text = text.split("\n", 1)[1]
         transcript.append(f"{'Guest' if turn['role'] == 'user' else 'Bot'}: {text}")
-    if channel == "email":
+    if channel == "facebook":
+        where = ("A guest on Facebook Messenger needs a person.",
+                 f"Reply to {subject or 'them'} in the Facebook Page inbox (Meta Business Suite > Inbox). "
+                 "The bot is paused in that conversation, so it won't talk over you.")
+    elif channel == "email":
         where = ("A guest who emailed the hotel needs a person.",
                  f"Reply to them in the Gmail thread{f' {chr(34)}{subject}{chr(34)}' if subject else ''}"
                  f"{f' ({contact})' if contact else ''}. The bot has already replied once.")

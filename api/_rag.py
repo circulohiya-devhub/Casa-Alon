@@ -113,7 +113,11 @@ End your reply with the exact tag {HANDOFF_TAG} when any of these apply:
 {BOOKING_HANDOFF}
 - A tool says the stay is longer than the hotel accepts online, or the guest needs more than one room, or has special requests such as events or group stays
 - The guest has a complaint, a refund request, or asks to talk to a person
-In those cases, give the front desk contact {FRONT_DESK}. Email guests: staff will reply to their email, so say a staff member will reply and don't ask for contact details. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
+In those cases, give the front desk contact {FRONT_DESK}. Email guests: staff will reply to their email, so say a staff member will reply and don't ask for contact details. Messenger guests: staff will reply in this Messenger conversation, so say a staff member will reply here and don't ask for contact details. Website guests can't be messaged back in this chat, so if the guest hasn't given their name and a mobile number or email in this conversation, ask for them so a staff member can contact them. When they reply with those details, end that reply with {HANDOFF_TAG} again so staff receive them. Only say a staff member will contact them once you have a way to reach them.
+
+REPLYING ON FACEBOOK MESSENGER
+- A message starting with [Messenger message from NAME] came through the hotel's Facebook Page. Keep replies short and conversational, in plain text, like a chat.
+- Messenger doesn't share the guest's email address. For a reservation, ask for their email address too, since the payment details are emailed.
 
 REPLYING BY EMAIL
 - A message starting with [Email from NAME <ADDRESS>, subject: ...] came by email, and you are writing the email reply. Answer every question in it.
@@ -397,7 +401,7 @@ def place_reservation(config: RunnableConfig) -> str:
     same reply as review_reservation."""
     thread = _thread(config)
     pending = memory.get_pending(thread)
-    window = EMAIL_REVIEW_MINUTES if thread.startswith("email:") else REVIEW_MINUTES
+    window = EMAIL_REVIEW_MINUTES if thread.startswith(("email:", "facebook:")) else REVIEW_MINUTES
     if not pending or time.time() - pending["created"] > window * 60:
         return "ERROR: there is no reviewed reservation waiting. Call review_reservation again first."
     if pending["turn"] >= memory.get_turn(thread):

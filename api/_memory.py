@@ -39,11 +39,11 @@ EMAIL_PENDING_TTL_SECONDS = 60 * 60 * 25       # a little past the 24h review wi
 
 
 def _history_ttl(thread_id: str) -> int:
-    return EMAIL_HISTORY_TTL_SECONDS if thread_id.startswith("email:") else HISTORY_TTL_SECONDS
+    return EMAIL_HISTORY_TTL_SECONDS if thread_id.startswith(("email:", "facebook:")) else HISTORY_TTL_SECONDS
 
 
 def _pending_ttl(thread_id: str) -> int:
-    return EMAIL_PENDING_TTL_SECONDS if thread_id.startswith("email:") else PENDING_TTL_SECONDS
+    return EMAIL_PENDING_TTL_SECONDS if thread_id.startswith(("email:", "facebook:")) else PENDING_TTL_SECONDS
 MAX_HISTORY_TURNS = 20                   # stored turns (user+assistant pairs count as 2)
 
 _client = None

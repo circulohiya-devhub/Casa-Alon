@@ -8,6 +8,12 @@
     },
     "api/gmail.py": {
       "maxDuration": 240
+    },
+    "api/messenger.py": {
+      "maxDuration": 15
+    },
+    "api/messenger_worker.py": {
+      "maxDuration": 240
     }
   }
 }
