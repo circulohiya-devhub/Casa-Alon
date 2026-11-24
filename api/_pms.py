@@ -8,7 +8,8 @@ cannot change or cancel reservations.
 
 PMS_PROVIDER in .env picks the source:
   mock       sample data for testing without any API (default)
-  hotelogix  the Hotelogix Web API (sandbox or live, set by HOTELOGIX_BASE_URL)
+  hotelogix  the Hotelog
+  ix Web API (sandbox or live, set by HOTELOGIX_BASE_URL)
 """
 import hashlib
 import hmac
